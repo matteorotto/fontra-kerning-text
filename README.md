@@ -81,6 +81,7 @@ Tutti i campi si possono modificare. Si conferma con **Invio**, con **Tab** o us
 
 - **Un valore** (`30`, `590/2`) vale per tutti i glifi selezionati: è il modo più veloce per dare lo stesso margine a un gruppo di lettere.
 - **Un'operazione relativa** (`+10`, `--10`, `*2`, `/2`) parte dal valore di ciascun glifo: `+10` aggiunge 10 a ognuno. Per sottrarre scrivi `--10` (`-10` è un numero negativo).
+- **Il nome di un glifo** (`H`), come in Glyphs: il margine resta collegato a H e lo segue quando lo modifichi. Vedi sotto.
 - **↑ / ↓** nei margini e nella larghezza: ±1, con **⇧** ±10.
 - **Riscrivere il valore già mostrato, o premere Invio senza cambiarlo, lo applica**, come nella Barra info. Con **Tutti i master** acceso è il modo più veloce per allineare i master: se il Regular mostra 30, Invio dà 30 anche agli altri. Entrare in un campo e uscire senza scrivere non cambia niente.
 - Se dopo aver scritto clicchi un altro glifo, il valore va ai glifi su cui stavi scrivendo, non a quello appena cliccato.
@@ -88,6 +89,29 @@ Tutti i campi si possono modificare. Si conferma con **Invio**, con **Tab** o us
 - **Margine sinistro**: sposta tutto il disegno, ancore e componenti compresi, come in Glyphs. **Larghezza**: cambia lo spazio a destra. **Margine destro**: cambia la larghezza.
 - **Gruppo**: scrivi il nome per mettere i glifi selezionati in quel gruppo (se non c'è, viene creato). Svuota il campo per toglierli dal gruppo. Con il plugin "Ancore e accentate", le accentate seguono la loro lettera base.
 - **⌘Z** annulla.
+
+### Margini collegati
+
+Nei campi **Sinistro**, **Destro** e **Larghezza** puoi scrivere il nome di un glifo invece del numero, come in Glyphs. Il campo resta **collegato** a quel glifo: quando lo modifichi, i glifi collegati si aggiornano da soli.
+
+Per esempio, H ha 40 a sinistra e a destra. Selezioni `I`, scrivi `H` nel margine sinistro e nel destro: la I prende 40 e 40. Se poi porti H a 45, anche la I passa a 45, in tutti i master.
+
+| Scrivi | Nel margine sinistro | Nel margine destro |
+|---|---|---|
+| `H` o `=H` | l'LSB di H | l'RSB di H |
+| `=\|H` | l'RSB di H (lato opposto) | l'LSB di H |
+| `H+10`, `=H-5`, `H*2` | l'LSB di H con il calcolo | l'RSB di H con il calcolo |
+
+- **Come si riconosce**: il valore è blu e sotto i campi compare la riga **Collegato** con il collegamento, per esempio `=H`. Cliccando nel campo vedi e puoi cambiare il collegamento. Con più glifi selezionati, se solo alcuni sono collegati la riga dice *in parte*.
+- **Più glifi insieme**: selezioni I, l, i, scrivi `H` nel margine sinistro, e tutti e tre restano collegati a H.
+- **Vale per tutti i master** del glifo, anche con **Tutti i master** spento: il Bold della I segue il Bold della H. Se H non ha un master in quella posizione, si usa il suo valore interpolato.
+- **Per scollegare** scrivi un numero (o usa ↑ ↓). Destro e larghezza si escludono, perché decidono tutti e due la larghezza: un collegamento o un numero in uno dei due toglie il collegamento dall'altro.
+- **Si aggiorna sempre**: qualunque modifica a H (dalla panoramica, dall'editor, con la Barra info, annullando) aggiorna i glifi collegati. Anche a catena (B collegata a D, D collegata a H) e attraverso i componenti (un glifo collegato a `kacute` segue la `k`).
+- **Il glifo collegato tiene il suo valore**: se sposti i punti della I nell'editor, il margine torna quello di H, come in Glyphs.
+- Va bene anche il carattere: `è` vale come `egrave`. I numeri restano numeri: `1` è il valore 1, non il glifo `one`. Se il nome non esiste, il campo diventa rosso e sotto compare il motivo.
+- **⌘Z** annulla il collegamento insieme ai valori.
+- I collegamenti sono salvati nel font (nei dati personalizzati, chiave `fontra.plugin.metricsKeys`), quindi restano quando lo riapri. Con "Rinomina e duplica glifi" 1.0.2 seguono i cambi di nome e passano alle copie.
+- Nell'editor gli stessi collegamenti si vedono e si modificano dalla Barra info 1.4.0.
 
 ### Tutti i master
 
@@ -98,14 +122,16 @@ Sotto i campi c'è l'interruttore **Tutti i master**, acceso di default (la scel
 
 I **gruppi di kerning** valgono sempre per tutti i master: in Fontra, come in Glyphs, il gruppo è del glifo, non del singolo master.
 
+Funziona con Fontra Pak 2026.10 e successivi.
+
 Come per gli altri plugin, la sezione compare nella panoramica dopo che hai aperto un glifo da lì (o dopo aver aperto la panoramica dal menu **Font** di un editor).
 
 ## Installazione
 
 1. Crea un repository **pubblico** su GitHub, per esempio `fontra-kerning-texts`.
 2. Carica `plugin.json` e `kerning-texts.js` (va bene anche questo README) nella radice del repository.
-3. Crea una release con tag `v1.2.2`.
-4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.2.2`.
+3. Crea una release con tag `v1.4.0`.
+4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.4.0`.
 5. Ricarica l'editor.
 
-Per aggiornare da una versione precedente: crea la release `v1.2.2`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.
+Per aggiornare da una versione precedente: crea la release `v1.4.0`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.

@@ -805,6 +805,7 @@ class KerningTextsPlugin {
     this.editor = editor;
     this.fc = editor.fontController;
     this.sc = editor.sceneController;
+    MetricsKeysEngine.install(this.fc);
     this.settings = {
       open: false, category: "Maiuscole", list: "uc-classic", context: "straight",
       perPage: 1, x: null, y: null, letter: "T", side: "both", current: {},
@@ -1583,6 +1584,445 @@ function isRelativeInput(text) {
   return t.startsWith("--") || /^[+*/]/.test(t);
 }
 
+// --- Nome di un glifo al posto del numero, come in Glyphs ----------------------
+// "H" o "=H": lo stesso margine di H (nello stesso master). "=|H": il margine
+// opposto di H (nel sinistro, il destro di H). "H+10", "=H*2": con un calcolo.
+// Va bene anche il carattere: "è" vale come "egrave".
+
+function resolveGlyphName(text, fontController) {
+  const glyphMap = fontController.glyphMap || {};
+  if (!text) return null;
+  if (glyphMap[text]) return text;
+  const chars = [...text];
+  if (chars.length === 1) {
+    const codePoint = chars[0].codePointAt(0);
+    for (const [name, codePoints] of Object.entries(glyphMap)) {
+      if (codePoints?.includes(codePoint)) return name;
+    }
+  }
+  return null;
+}
+
+function parseGlyphReference(text, fontController) {
+  let t = String(text).trim();
+  if (t.startsWith("=")) t = t.slice(1).trim();
+  let opposite = false;
+  if (t.startsWith("|")) {
+    opposite = true;
+    t = t.slice(1).trim();
+  }
+  if (!t) return null;
+  const whole = resolveGlyphName(t, fontController);
+  if (whole) return { glyphName: whole, opposite, operation: "" };
+  // il nome più lungo seguito da un calcolo: "H+10", "a.ss01*2"
+  for (let i = t.length - 1; i > 0; i--) {
+    if (!"+-*/".includes(t[i])) continue;
+    const glyphName = resolveGlyphName(t.slice(0, i).trim(), fontController);
+    const operation = t.slice(i).replace(/\s+/g, "");
+    if (glyphName && Number.isFinite(calculate(`1${operation}`))) return { glyphName, opposite, operation };
+  }
+  return null;
+}
+
+// Margini e larghezza di un glifo in una posizione: dal master, se c'è,
+// altrimenti interpolati
+async function glyphMetricsAt(fontController, glyphName, location) {
+  const varGlyph = await fontController.getGlyph(glyphName);
+  if (!varGlyph) return null;
+  let controller = null;
+  let sourceIndex;
+  try {
+    sourceIndex = varGlyph.getSourceIndex(location);
+  } catch (error) {
+    sourceIndex = undefined;
+  }
+  if (sourceIndex !== undefined) {
+    const layerName = varGlyph.sources[sourceIndex].layerName;
+    if (varGlyph.glyph.layers[layerName]) {
+      controller = await fontController.getLayerGlyphController(glyphName, layerName, sourceIndex);
+    }
+  }
+  if (!controller) controller = await fontController.getGlyphInstance(glyphName, location);
+  if (!controller) return null;
+  const bounds = controller.bounds;
+  const xAdvance = controller.xAdvance;
+  return {
+    lsb: bounds ? bounds.xMin : null,
+    rsb: bounds ? xAdvance - bounds.xMax : null,
+    width: xAdvance,
+  };
+}
+
+async function referenceValue(fontController, reference, field, location) {
+  const metrics = await glyphMetricsAt(fontController, reference.glyphName, location);
+  if (!metrics) return null;
+  let key = field;
+  if (reference.opposite && field === "lsb") key = "rsb";
+  else if (reference.opposite && field === "rsb") key = "lsb";
+  const value = metrics[key];
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  if (!reference.operation) return value;
+  const result = calculate(`(${Math.round(value * 1000) / 1000})${reference.operation}`);
+  return Number.isFinite(result) ? result : null;
+}
+
+// --- Margini collegati, come le "metrics keys" di Glyphs ----------------------
+// Scrivendo "H" nel margine sinistro di I, il margine resta collegato a H:
+// quando cambia H, I si aggiorna da solo, in tutti i master.
+// I collegamenti sono salvati nel font, in customData["fontra.plugin.metricsKeys"]:
+//   { "I": { "lsb": { "glyph": "H" }, "rsb": { "glyph": "H", "opposite": true, "op": "+5" } } }
+// Lo stesso codice è nei plugin "Barra info" e "Testi di kerning": in ogni
+// finestra ne lavora uno solo.
+
+const MK_DATA_KEY = "fontra.plugin.metricsKeys";
+const MK_META = "metricsKeysPlugin";
+const MK_ENGINE = "__fontraMetricsKeysEngine";
+const MK_FIELDS = ["lsb", "rsb", "width"];
+const MK_DELAY_MS = 120;
+const MK_GLYPHS_PER_CHUNK = 40;
+
+class MKBuilder {
+  constructor() {
+    this.forward = [];
+    this.backward = [];
+  }
+}
+
+function mkClone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function mkSet(builder, path, key, newValue, oldValue) {
+  builder.forward.push({ p: path, f: "=", a: [key, mkClone(newValue)] });
+  builder.backward.unshift(
+    oldValue === undefined ? { p: path, f: "d", a: [key] } : { p: path, f: "=", a: [key, mkClone(oldValue)] }
+  );
+}
+
+function mkDelete(builder, path, key, oldValue) {
+  builder.forward.push({ p: path, f: "d", a: [key] });
+  builder.backward.unshift({ p: path, f: "=", a: [key, mkClone(oldValue)] });
+}
+
+function mkAll(fontController) {
+  const all = fontController.customData?.[MK_DATA_KEY];
+  return all && typeof all === "object" ? all : {};
+}
+
+function mkLinksFor(fontController, glyphName) {
+  return mkAll(fontController)[glyphName] || {};
+}
+
+// Il collegamento come si scrive: "=H", "=|H", "=H+10"
+function mkText(link) {
+  if (!link?.glyph) return "";
+  return `=${link.opposite ? "|" : ""}${link.glyph}${link.op || ""}`;
+}
+
+function mkLinkFromReference(reference) {
+  const link = { glyph: reference.glyphName };
+  if (reference.opposite) link.opposite = true;
+  if (reference.operation) link.op = reference.operation;
+  return link;
+}
+
+function mkReference(link) {
+  return { glyphName: link.glyph, opposite: !!link.opposite, operation: link.op || "" };
+}
+
+// Cosa cambia nei collegamenti scrivendo in un campo: il nome di un glifo
+// collega il campo, un numero lo scollega. Destro e larghezza si escludono,
+// perché decidono tutti e due la larghezza del glifo.
+function mkUpdatesForInput(field, reference) {
+  const updates = { [field]: reference ? mkLinkFromReference(reference) : null };
+  if (field === "rsb") updates.width = null;
+  else if (field === "width") updates.rsb = null;
+  return updates;
+}
+
+// Aggiunge al builder le modifiche ai collegamenti dei glifi. Restituisce i
+// collegamenti nuovi di ogni glifo.
+function mkPlanLinks(fontController, builder, glyphNames, updates) {
+  const customData = fontController.customData;
+  const all = customData?.[MK_DATA_KEY];
+  const base = ["customData", MK_DATA_KEY];
+  let created = false;
+  const result = {};
+  for (const name of glyphNames) {
+    const old = all?.[name];
+    const next = { ...(old || {}) };
+    for (const [field, link] of Object.entries(updates)) {
+      // un glifo non si collega a se stesso
+      if (link && link.glyph !== name) next[field] = link;
+      else if (!link) delete next[field];
+    }
+    result[name] = next;
+    if (JSON.stringify(old || {}) === JSON.stringify(next)) continue;
+    if (!all && !created) {
+      if (!customData) continue;
+      mkSet(builder, ["customData"], MK_DATA_KEY, {}, undefined);
+      created = true;
+    }
+    if (Object.keys(next).length) mkSet(builder, base, name, next, old);
+    else if (old) mkDelete(builder, base, name, old);
+  }
+  return result;
+}
+
+// Sposta in orizzontale contorni, componenti, ancore e guide (non la larghezza)
+function mkShift(builder, base, glyph, dx) {
+  const path = mkClone(glyph.path);
+  if (path?.coordinates?.length) {
+    for (let i = 0; i < path.coordinates.length; i += 2) path.coordinates[i] += dx;
+    mkSet(builder, base, "path", path, glyph.path);
+  }
+  (glyph.components || []).forEach((component, index) => {
+    const t = component.transformation || {};
+    mkSet(builder, [...base, "components", index, "transformation"], "translateX", (t.translateX || 0) + dx, t.translateX || 0);
+  });
+  if (glyph.anchors?.length) {
+    mkSet(builder, base, "anchors", glyph.anchors.map((a) => ({ ...mkClone(a), x: a.x + dx })), glyph.anchors);
+  }
+  if (glyph.guidelines?.length) {
+    mkSet(
+      builder,
+      base,
+      "guidelines",
+      glyph.guidelines.map((g) => (Number.isFinite(g.x) ? { ...mkClone(g), x: g.x + dx } : mkClone(g))),
+      glyph.guidelines
+    );
+  }
+}
+
+// Applica i collegamenti di un glifo in tutti i suoi master.
+// found: il glifo di riferimento ha dato almeno un valore.
+async function mkPlanGlyph(fontController, glyphName, links, builder) {
+  const refs = {};
+  for (const field of MK_FIELDS) {
+    const link = links?.[field];
+    if (link?.glyph && link.glyph !== glyphName && link.glyph in fontController.glyphMap) refs[field] = mkReference(link);
+  }
+  const result = { changed: false, found: false };
+  if (!Object.keys(refs).length) return result;
+  const varGlyph = await fontController.getGlyph(glyphName);
+  if (!varGlyph) return result;
+  const seen = new Set();
+  for (const [sourceIndex, source] of varGlyph.sources.entries()) {
+    const layer = varGlyph.glyph.layers[source.layerName];
+    if (source.inactive || !layer || seen.has(source.layerName)) continue;
+    seen.add(source.layerName);
+    const glyph = layer.glyph;
+    const controller = await fontController.getLayerGlyphController(glyphName, source.layerName, sourceIndex);
+    const bounds = controller?.bounds;
+    const location = varGlyph.getDenseSourceLocationForSource(source);
+    let dx = 0;
+    let xAdvance = glyph.xAdvance;
+    if (refs.lsb && bounds) {
+      const target = await referenceValue(fontController, refs.lsb, "lsb", location);
+      if (target !== null) {
+        result.found = true;
+        dx = Math.round(target - bounds.xMin);
+      }
+    }
+    xAdvance += dx;
+    if (refs.width) {
+      const target = await referenceValue(fontController, refs.width, "width", location);
+      if (target !== null) {
+        result.found = true;
+        xAdvance = Math.max(0, Math.round(target));
+      }
+    } else if (refs.rsb && bounds) {
+      const target = await referenceValue(fontController, refs.rsb, "rsb", location);
+      if (target !== null) {
+        result.found = true;
+        xAdvance = Math.round(bounds.xMax + dx + target);
+      }
+    }
+    const base = ["glyphs", glyphName, "layers", source.layerName, "glyph"];
+    if (dx) mkShift(builder, base, glyph, dx);
+    if (xAdvance !== glyph.xAdvance) mkSet(builder, base, "xAdvance", xAdvance, glyph.xAdvance);
+    if (dx || xAdvance !== glyph.xAdvance) result.changed = true;
+  }
+  return result;
+}
+
+function mkGlyphNamesOfChange(change, prefix = [], names = new Set()) {
+  const path = [...prefix, ...(change.p || [])];
+  if (path[0] === "glyphs") {
+    if (path.length > 1) names.add(path[1]);
+    else if (change.f && change.a?.[0] !== undefined) names.add(change.a[0]);
+  }
+  for (const child of change.c || []) mkGlyphNamesOfChange(child, path, names);
+  return names;
+}
+
+function mkGlyphNameOfSubChange(change) {
+  const path = change.p || [];
+  if (path[0] !== "glyphs") return null;
+  return path.length > 1 ? path[1] : change.a?.[0] ?? null;
+}
+
+// Il server di Fontra tiene in memoria 128 glifi per volta: le modifiche
+// grandi partono a blocchi
+async function mkPost(fontController, change, rollbackChange, label) {
+  const names = new Set((change.c || []).map(mkGlyphNameOfSubChange).filter((n) => n !== null));
+  if (names.size <= MK_GLYPHS_PER_CHUNK) {
+    await fontController.postChange(change, rollbackChange, label);
+    return;
+  }
+  let chunk = [];
+  let chunkNames = new Set();
+  const send = async () => {
+    if (!chunk.length) return;
+    await fontController.postChange({ c: chunk, [MK_META]: change[MK_META] }, { c: [] }, label);
+    chunk = [];
+    chunkNames = new Set();
+  };
+  for (const sub of change.c || []) {
+    const name = mkGlyphNameOfSubChange(sub);
+    if (name !== null && !chunkNames.has(name) && chunkNames.size >= MK_GLYPHS_PER_CHUNK) await send();
+    if (name !== null) chunkNames.add(name);
+    chunk.push(sub);
+  }
+  await send();
+}
+
+// Tiene aggiornati i margini collegati. Reagisce solo alle modifiche fatte in
+// questa finestra: le altre finestre ricevono il risultato dal server.
+class MetricsKeysEngine {
+  static install(fontController) {
+    if (!fontController) return null;
+    if (!fontController[MK_ENGINE]) fontController[MK_ENGINE] = new MetricsKeysEngine(fontController);
+    return fontController[MK_ENGINE];
+  }
+
+  constructor(fontController) {
+    this.fc = fontController;
+    this.pending = new Set();
+    this.running = false;
+    this.snapshot = this.takeSnapshot();
+    fontController.addChangeListener(
+      { glyphs: null, customData: null },
+      (change, isExternalChange) => this.onChange(change, isExternalChange),
+      false
+    );
+  }
+
+  takeSnapshot() {
+    const snapshot = new Map();
+    for (const [name, links] of Object.entries(mkAll(this.fc))) snapshot.set(name, JSON.stringify(links));
+    return snapshot;
+  }
+
+  onChange(change, isExternalChange) {
+    const previous = this.snapshot;
+    this.snapshot = this.takeSnapshot();
+    if (isExternalChange || !change || change[MK_META]) return;
+    // glifi con un collegamento nuovo o cambiato (anche da un annulla)
+    for (const name of new Set([...previous.keys(), ...this.snapshot.keys()])) {
+      if (previous.get(name) !== this.snapshot.get(name)) this.pending.add(name);
+    }
+    for (const name of mkGlyphNamesOfChange(change)) this.pending.add(name);
+    if (this.pending.size) this.schedule();
+  }
+
+  schedule() {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.run(), MK_DELAY_MS);
+  }
+
+  usersOf(name) {
+    try {
+      return [...(this.fc.iterGlyphsUsedByRecursively?.(name) || [])];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async run() {
+    if (this.running) {
+      this.schedule();
+      return;
+    }
+    this.running = true;
+    try {
+      const fc = this.fc;
+      const changed = [...this.pending];
+      this.pending.clear();
+      const all = mkAll(fc);
+      if (!Object.keys(all).length) return;
+
+      // chi dipende da chi
+      const dependents = new Map();
+      for (const [name, links] of Object.entries(all)) {
+        if (!(name in fc.glyphMap)) continue;
+        for (const field of MK_FIELDS) {
+          const ref = links?.[field]?.glyph;
+          if (!ref || ref === name) continue;
+          if (!dependents.has(ref)) dependents.set(ref, new Set());
+          dependents.get(ref).add(name);
+        }
+      }
+
+      // Da aggiornare: i glifi cambiati che hanno collegamenti e, a catena, chi
+      // dipende da loro (anche attraverso i componenti: se cambia H, cambia
+      // anche un glifo che contiene H)
+      const affected = new Set();
+      const expanded = new Set();
+      const expand = (name) => {
+        if (expanded.has(name)) return;
+        expanded.add(name);
+        for (const dependent of dependents.get(name) || []) {
+          affected.add(dependent);
+          expand(dependent);
+        }
+        for (const user of this.usersOf(name)) {
+          if (all[user] && user in fc.glyphMap) affected.add(user);
+          expand(user);
+        }
+      };
+      for (const name of changed) {
+        if (all[name] && name in fc.glyphMap) affected.add(name);
+        expand(name);
+      }
+      if (!affected.size) return;
+
+      // prima i glifi di riferimento, poi chi li usa
+      const order = [];
+      const placed = new Set();
+      const place = (name) => {
+        if (placed.has(name)) return;
+        placed.add(name);
+        for (const field of MK_FIELDS) {
+          const ref = all[name]?.[field]?.glyph;
+          if (ref && affected.has(ref)) place(ref);
+        }
+        order.push(name);
+      };
+      for (const name of affected) place(name);
+
+      let forward = [];
+      let backward = [];
+      for (const name of order) {
+        const builder = new MKBuilder();
+        const { changed: glyphChanged } = await mkPlanGlyph(fc, name, all[name], builder);
+        if (!glyphChanged || !builder.forward.length) continue;
+        // subito nel font, così chi viene dopo legge i valori nuovi
+        await fc.applyChange({ c: builder.forward, [MK_META]: true });
+        forward = forward.concat(builder.forward);
+        backward = builder.backward.concat(backward);
+      }
+      if (!forward.length) return;
+      const label = "Margini collegati";
+      await mkPost(fc, { c: forward, [MK_META]: { label } }, { c: backward, [MK_META]: { label } }, label);
+    } catch (error) {
+      console.error("[Margini collegati]", error);
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 const METRICS_CSS = `
   :host { display: block; font-size: 0.95em; }
   .who { margin: 0 0 6px; min-height: 1.2em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1608,6 +2048,9 @@ const METRICS_CSS = `
   .all input { width: auto; margin: 0; }
   .note:empty { display: none; }
   .note.error-note { opacity: 1; color: #e03131; }
+  input.linked { color: #3b82f6; }
+  .link { text-align: center; font-size: 0.8em; color: #3b82f6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .link-row[hidden] { display: none; }
 `;
 
 class MetricsElement extends HTMLElement {
@@ -1620,9 +2063,13 @@ class MetricsElement extends HTMLElement {
       <div class="grid">
         <span></span><span class="col">Sinistro</span><span class="col">Larghezza</span><span class="col">Destro</span>
         <span class="lab">Margine</span>
-        <input id="lsb" title="Margine sinistro (LSB)" />
-        <input id="width" title="Larghezza" />
-        <input id="rsb" title="Margine destro (RSB)" />
+        <input id="lsb" title="Margine sinistro (LSB): un numero, +10, --10, oppure il nome di un glifo (H) per collegarlo al suo margine" />
+        <input id="width" title="Larghezza: un numero, +10, --10, oppure il nome di un glifo (H) per collegarla alla sua larghezza" />
+        <input id="rsb" title="Margine destro (RSB): un numero, +10, --10, oppure il nome di un glifo (H) per collegarlo al suo margine" />
+        <span class="lab link-row" hidden>Collegato</span>
+        <span class="link link-row" id="link-lsb" hidden></span>
+        <span class="link link-row" id="link-width" hidden></span>
+        <span class="link link-row" id="link-rsb" hidden></span>
         <span class="lab">Gruppo</span>
         <div class="groups">
           <input id="groupL" title="Gruppo di kerning del lato sinistro" spellcheck="false" />
@@ -1658,6 +2105,8 @@ class OverviewMetrics {
     this.setupInputs();
     this.insertInSidebar();
     this.installChunkedUndo();
+    // Margini collegati: quando cambia un glifo, chi è collegato a lui si aggiorna
+    MetricsKeysEngine.install(this.fc);
 
     // La panoramica di Fontra non riceve le modifiche al kerning fatte altrove
     loadKerning(this.fc)
@@ -1676,6 +2125,7 @@ class OverviewMetrics {
     });
     this.fc.addChangeListener({ glyphs: null }, schedule, false);
     this.fc.addChangeListener({ glyphMap: null }, schedule, false);
+    this.fc.addChangeListener({ customData: null }, schedule, false);
     this.fc.addChangeListener(
       { kerning: null },
       (change) => {
@@ -1760,7 +2210,7 @@ class OverviewMetrics {
     let layerName = null;
     if (sourceIndex !== undefined) {
       layerName = varGlyph.sources[sourceIndex].layerName;
-      controller = await varGlyph.getLayerGlyphController(layerName, sourceIndex);
+      controller = await this.fc.getLayerGlyphController(name, layerName, sourceIndex);
     } else {
       controller = await this.fc.getGlyphInstance(name, location);
     }
@@ -1769,6 +2219,7 @@ class OverviewMetrics {
     const xAdvance = controller.xAdvance;
     return {
       name,
+      location: sourceIndex !== undefined ? varGlyph.getDenseSourceLocationForSource(varGlyph.sources[sourceIndex]) : location,
       hasMasters: varGlyph.sources.some((source) => !source.inactive && varGlyph.glyph.layers[source.layerName]),
       editable: sourceIndex !== undefined && !!varGlyph.glyph.layers[layerName],
       layerName,
@@ -1791,6 +2242,11 @@ class OverviewMetrics {
     if (!names.length) {
       who.textContent = "Nessun glifo selezionato";
       for (const id of fields) this.setField(id, "", "", true);
+      for (const id of ["lsb", "width", "rsb"]) {
+        delete $(`#${id}`).dataset.key;
+        $(`#${id}`).classList.remove("linked");
+      }
+      for (const el of this.element.shadowRoot.querySelectorAll(".link-row")) el.hidden = true;
       note.textContent = "";
       this.infos = [];
       return;
@@ -1837,6 +2293,22 @@ class OverviewMetrics {
       const { value, placeholder } = combine(infos.map((i) => i[id]));
       this.setField(id, value, placeholder, readOnly);
     }
+    // Margini collegati: il campo è blu, sotto c'è a cosa è collegato
+    const allLinks = mkAll(this.fc);
+    let anyLink = false;
+    for (const id of ["lsb", "width", "rsb"]) {
+      const texts = infos.map((i) => mkText(allLinks[i.name]?.[id]));
+      const some = texts.some(Boolean);
+      const same = texts.length > 0 && texts.every((t) => t === texts[0]);
+      const input = $(`#${id}`);
+      if (same && texts[0]) input.dataset.key = texts[0];
+      else delete input.dataset.key;
+      input.classList.toggle("linked", some);
+      $(`#link-${id}`).textContent = !some ? "" : same ? texts[0] : "in parte";
+      $(`#link-${id}`).title = same && texts[0] ? `Collegato: ${texts[0]}. Scrivi un numero per scollegarlo.` : "";
+      anyLink = anyLink || some;
+    }
+    for (const el of this.element.shadowRoot.querySelectorAll(".link-row")) el.hidden = !anyLink;
     const groupsLeft = infos.map((i) => this.kc?.rightPairGroupMapping?.[i.name] || "");
     const groupsRight = infos.map((i) => this.kc?.leftPairGroupMapping?.[i.name] || "");
     const sameL = groupsLeft.every((g) => g === groupsLeft[0]);
@@ -1867,7 +2339,7 @@ class OverviewMetrics {
     input.disabled = !!disabled;
     input.placeholder = placeholder || "";
     // non disturbare chi sta scrivendo
-    if (this.element.shadowRoot.activeElement === input && input.dataset.dirty) return;
+    if (this.element.shadowRoot.activeElement === input && (input.dataset.dirty || (input.dataset.key && input.value === input.dataset.key))) return;
     input.value = value ?? "";
     input.dataset.original = input.value;
     input.classList.remove("error");
@@ -1881,6 +2353,8 @@ class OverviewMetrics {
       const isNumber = ["lsb", "width", "rsb"].includes(id);
       input.addEventListener("focus", () => {
         delete input.dataset.dirty;
+        // un campo collegato mostra il collegamento ("=H"), da modificare o sostituire
+        if (input.dataset.key) input.value = input.dataset.key;
         input.dataset.original = input.value;
         // I glifi su cui stai lavorando: se poi clicchi un altro glifo per uscire
         // dal campo, il valore va comunque a questi
@@ -1897,6 +2371,7 @@ class OverviewMetrics {
         const names = this.editingNames;
         this.editingNames = null;
         if (changed) this.commit(id, input.value, input, names);
+        else if (input.dataset.key) this.scheduleRefresh();
       });
       input.addEventListener("keydown", (event) => {
         event.stopPropagation(); // le scorciatoie della panoramica (⌫, ⌘A, …) non devono scattare
@@ -1920,6 +2395,9 @@ class OverviewMetrics {
 
   async commit(id, text, input, names = null) {
     names = names?.length ? names : this.selectedNames;
+    // un nuovo valore cancella il messaggio d'errore di prima
+    this.errorText = null;
+    input?.classList.remove("error");
     try {
       if (id === "groupL" || id === "groupR") await this.commitGroup(id, text, input, names);
       else await this.commitMetric(id, text, input, names);
@@ -1963,11 +2441,12 @@ class OverviewMetrics {
         const layer = varGlyph.glyph.layers[source.layerName];
         if (source.inactive || !layer || seen.has(source.layerName)) continue;
         seen.add(source.layerName);
-        const controller = await varGlyph.getLayerGlyphController(source.layerName, sourceIndex);
+        const controller = await this.fc.getLayerGlyphController(info.name, source.layerName, sourceIndex);
         const bounds = controller?.bounds;
         const xAdvance = controller?.xAdvance ?? layer.glyph.xAdvance;
         targets.push({
           name: info.name,
+          location: varGlyph.getDenseSourceLocationForSource(source),
           layerName: source.layerName,
           layerGlyph: layer.glyph,
           bounds,
@@ -1984,10 +2463,41 @@ class OverviewMetrics {
     if (this.fc.readOnly) return;
     const relative = isRelativeInput(text);
     const absolute = relative ? null : evaluateInput(text, null);
-    if (!relative && absolute === null) {
-      this.showError(input, `«${text}» non è un valore valido: scrivi un numero (40), un calcolo (590/2) o un'operazione (+10, --10, *2, /2).`);
+    // Il nome di un glifo ("H", "=H", "=|H", "H+10"): il suo valore, master per master
+    const reference = !relative && absolute === null ? parseGlyphReference(text, this.fc) : null;
+    if (!relative && absolute === null && !reference) {
+      this.showError(
+        input,
+        `«${text}» non è un valore valido: scrivi un numero (40), un calcolo (590/2), un'operazione (+10, --10, *2, /2) o il nome di un glifo (H).`
+      );
       return;
     }
+    const labels = { lsb: "Margine sinistro", rsb: "Margine destro", width: "Larghezza" };
+
+    // Il nome di un glifo collega il campo, come in Glyphs: il valore segue
+    // quel glifo, in tutti i master, anche quando lo modifichi dopo.
+    if (reference) {
+      const targets = names.filter((name) => name !== reference.glyphName && name in this.fc.glyphMap);
+      if (!targets.length) {
+        this.showError(input, `Un glifo non può essere collegato a se stesso.`);
+        return;
+      }
+      const builder = new ChangeBuilder();
+      const links = mkPlanLinks(this.fc, builder, targets, mkUpdatesForInput(id, reference));
+      let found = false;
+      for (const name of targets) {
+        const { found: glyphFound } = await mkPlanGlyph(this.fc, name, links[name], builder);
+        found = found || glyphFound;
+      }
+      if (!found) {
+        this.showError(input, `«${reference.glyphName}» non ha contorni, quindi non ha margini da copiare.`);
+        return;
+      }
+      if (builder.isEmpty) return;
+      await this.post(builder, `${labels[id]} collegato a ${reference.glyphName}`);
+      return;
+    }
+
     // Un valore: uguale per tutti. Un'operazione: dal valore di ogni glifo e master.
     const infos = await this.metricTargets(names);
     if (!infos.length) return;
@@ -2009,8 +2519,9 @@ class OverviewMetrics {
         this.shiftLayer(builder, base, glyph, target - own);
       }
     }
+    // Un numero scollega il campo (e, per destro e larghezza, anche l'altro)
+    mkPlanLinks(this.fc, builder, [...new Set(infos.map((info) => info.name))], mkUpdatesForInput(id, null));
     if (builder.isEmpty) return;
-    const labels = { lsb: "Margine sinistro", rsb: "Margine destro", width: "Larghezza" };
     await this.post(builder, labels[id] + (this.allMasters ? " (tutti i master)" : ""));
   }
 
