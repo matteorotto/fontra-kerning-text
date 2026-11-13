@@ -1,0 +1,7 @@
+{
+  "name": "Testi di kerning",
+  "description": "Come in Glyphs: un pannello con testi pronti per il kerning (coppie classiche, tutte le coppie per gruppo, punteggiatura, numeri, accentate, casi limite, italiano), una coppia alla volta nello strumento Kerning. Nella panoramica del font: margini, larghezza e gruppi di kerning dei glifi selezionati, modificabili.",
+  "version": "1.2.0",
+  "init": "kerning-texts.js",
+  "function": "start"
+}
