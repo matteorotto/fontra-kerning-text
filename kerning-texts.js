@@ -1630,6 +1630,13 @@ class OverviewMetrics {
 
     const schedule = () => this.scheduleRefresh();
     this.settings.addKeyListener(["glyphSelection", "fontLocationSourceMapped"], schedule);
+    // Se la selezione cambia mentre sei in un campo ma non hai ancora scritto,
+    // il campo segue la nuova selezione; se hai già scritto, il valore va ai
+    // glifi su cui stavi scrivendo.
+    this.settings.addKeyListener("glyphSelection", () => {
+      const active = this.element.shadowRoot.activeElement;
+      if (active && active.type !== "checkbox" && !active.dataset.dirty) this.editingNames = this.selectedNames;
+    });
     this.fc.addChangeListener({ glyphs: null }, schedule, false);
     this.fc.addChangeListener({ glyphMap: null }, schedule, false);
     this.fc.addChangeListener(
@@ -1681,8 +1688,15 @@ class OverviewMetrics {
     return [...(this.settings.model.glyphSelection || [])].filter((n) => n in glyphMap);
   }
 
+  // Posizione per disegnare (come le caselle della panoramica)
   get location() {
     return this.settings.model.fontLocationSourceMapped || {};
+  }
+
+  // Posizione per trovare il master: quella vera, non "mappata" (nei font con
+  // assi collegati tra loro le due sono diverse)
+  get sourceLocation() {
+    return this.settings.model.fontLocationSource || this.location;
   }
 
   // --- lettura ---------------------------------------------------------------
@@ -1698,7 +1712,10 @@ class OverviewMetrics {
     const location = this.location;
     let sourceIndex;
     try {
-      sourceIndex = varGlyph.getSourceIndex(location);
+      sourceIndex = varGlyph.getSourceIndex(this.sourceLocation);
+      if (sourceIndex === undefined && this.sourceLocation !== location) {
+        sourceIndex = varGlyph.getSourceIndex(location);
+      }
     } catch (error) {
       sourceIndex = undefined;
     }
@@ -1824,13 +1841,21 @@ class OverviewMetrics {
       input.addEventListener("focus", () => {
         delete input.dataset.dirty;
         input.dataset.original = input.value;
+        // I glifi su cui stai lavorando: se poi clicchi un altro glifo per uscire
+        // dal campo, il valore va comunque a questi
+        this.editingNames = this.selectedNames;
         setTimeout(() => input.select(), 0);
       });
       input.addEventListener("input", () => (input.dataset.dirty = "1"));
       input.addEventListener("blur", () => {
-        const changed = !!input.dataset.dirty && input.value !== (input.dataset.original ?? "");
+        // Come nella Barra info: se hai scritto qualcosa (anche lo stesso valore) o
+        // premuto Invio, si applica. Così riscrivere il valore allinea tutti i master.
+        const changed =
+          !!input.dataset.dirty && (input.value.trim() !== "" || input.value !== (input.dataset.original ?? ""));
         delete input.dataset.dirty;
-        if (changed) this.commit(id, input.value, input);
+        const names = this.editingNames;
+        this.editingNames = null;
+        if (changed) this.commit(id, input.value, input, names);
       });
       input.addEventListener("keydown", (event) => {
         event.stopPropagation(); // le scorciatoie della panoramica (⌫, ⌘A, …) non devono scattare
@@ -1846,16 +1871,17 @@ class OverviewMetrics {
         } else if (isNumber && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
           event.preventDefault();
           const step = event.shiftKey ? 10 : 1;
-          this.commit(id, event.key === "ArrowUp" ? `+${step}` : `--${step}`, input);
+          this.commit(id, event.key === "ArrowUp" ? `+${step}` : `--${step}`, input, this.editingNames);
         }
       });
     }
   }
 
-  async commit(id, text, input) {
+  async commit(id, text, input, names = null) {
+    names = names?.length ? names : this.selectedNames;
     try {
-      if (id === "groupL" || id === "groupR") await this.commitGroup(id, text, input);
-      else await this.commitMetric(id, text, input);
+      if (id === "groupL" || id === "groupR") await this.commitGroup(id, text, input, names);
+      else await this.commitMetric(id, text, input, names);
     } catch (error) {
       console.error("[Testi di kerning]", error);
       input.classList.add("error");
@@ -1864,10 +1890,16 @@ class OverviewMetrics {
   }
 
   // I livelli da modificare: solo il master scelto in Source, o tutti i master
-  async metricTargets() {
-    if (!this.allMasters) return (this.infos || []).filter((i) => i.editable);
+  async metricTargets(names) {
+    // Valori letti adesso, per i glifi su cui stavi lavorando
+    const infos = [];
+    for (const name of names) {
+      const info = await this.metricsFor(name);
+      if (info) infos.push(info);
+    }
+    if (!this.allMasters) return infos.filter((i) => i.editable);
     const targets = [];
-    for (const info of this.infos || []) {
+    for (const info of infos) {
       const varGlyph = await this.fc.getGlyph(info.name);
       if (!varGlyph) continue;
       const seen = new Set();
@@ -1892,7 +1924,7 @@ class OverviewMetrics {
     return targets;
   }
 
-  async commitMetric(id, text, input) {
+  async commitMetric(id, text, input, names) {
     if (this.fc.readOnly) return;
     const relative = isRelativeInput(text);
     const absolute = relative ? null : evaluateInput(text, null);
@@ -1901,7 +1933,7 @@ class OverviewMetrics {
       return;
     }
     // Un valore: uguale per tutti. Un'operazione: dal valore di ogni glifo e master.
-    const infos = await this.metricTargets();
+    const infos = await this.metricTargets(names);
     if (!infos.length) return;
     const builder = new ChangeBuilder();
     for (const info of infos) {
@@ -1952,7 +1984,7 @@ class OverviewMetrics {
     builder.set(base, "xAdvance", glyph.xAdvance + dx, glyph.xAdvance);
   }
 
-  async commitGroup(id, text, input) {
+  async commitGroup(id, text, input, names) {
     if (this.fc.readOnly) return;
     const groupName = String(text).trim();
     if (groupName && !GROUP_NAME.test(groupName)) {
@@ -1960,7 +1992,6 @@ class OverviewMetrics {
       input.title = "Nome di gruppo non valido: usa lettere, numeri, punto, trattino e trattino basso.";
       return;
     }
-    const names = this.selectedNames;
     if (!names.length) return;
     const kerning = await loadKerning(this.fc);
     const builder = new ChangeBuilder();
