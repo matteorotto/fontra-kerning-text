@@ -1533,13 +1533,49 @@ function evaluateInput(text, current) {
     if (operand === null || current === null || current === undefined) return null;
     return { "+": current + operand, "-": current - operand, "*": current * operand, "/": operand ? current / operand : null }[relative];
   }
-  if (!/^[0-9+\-*/().\s]+$/.test(t)) return null;
-  try {
-    const value = Function(`"use strict"; return (${t});`)();
-    return Number.isFinite(value) ? value : null;
-  } catch (error) {
-    return null;
-  }
+  const value = calculate(t);
+  return Number.isFinite(value) ? value : null;
+}
+
+// Calcolatrice per + - * / e parentesi, senza eval: funziona anche dove il
+// browser blocca il codice generato al volo
+function calculate(text) {
+  const tokens = String(text).replace(/\s+/g, "").match(/\d+(?:\.\d*)?|\.\d+|[-+*/()]/g);
+  if (!tokens || tokens.join("") !== String(text).replace(/\s+/g, "")) return NaN;
+  let i = 0;
+  const peek = () => tokens[i];
+  const next = () => tokens[i++];
+  const factor = () => {
+    const token = next();
+    if (token === "-") return -factor();
+    if (token === "+") return factor();
+    if (token === "(") {
+      const value = sum();
+      return next() === ")" ? value : NaN;
+    }
+    const number = parseFloat(token);
+    return Number.isFinite(number) ? number : NaN;
+  };
+  const product = () => {
+    let value = factor();
+    while (peek() === "*" || peek() === "/") {
+      const op = next();
+      const right = factor();
+      value = op === "*" ? value * right : value / right;
+    }
+    return value;
+  };
+  const sum = () => {
+    let value = product();
+    while (peek() === "+" || peek() === "-") {
+      const op = next();
+      const right = product();
+      value = op === "+" ? value + right : value - right;
+    }
+    return value;
+  };
+  const result = sum();
+  return i === tokens.length ? result : NaN;
 }
 
 function isRelativeInput(text) {
@@ -1571,6 +1607,7 @@ const METRICS_CSS = `
   .all { display: flex; align-items: center; gap: 5px; margin-top: 6px; font-size: 0.9em; cursor: pointer; user-select: none; }
   .all input { width: auto; margin: 0; }
   .note:empty { display: none; }
+  .note.error-note { opacity: 1; color: #e03131; }
 `;
 
 class MetricsElement extends HTMLElement {
@@ -1807,7 +1844,11 @@ class OverviewMetrics {
     this.setField("groupL", sameL ? groupsLeft[0] : "", sameL ? "" : "multipli", this.fc.readOnly);
     this.setField("groupR", sameR ? groupsRight[0] : "", sameR ? "" : "multipli", this.fc.readOnly);
 
-    if (this.allMasters) {
+    note.classList.remove("error-note");
+    if (this.errorText && Date.now() < (this.errorUntil || 0)) {
+      note.textContent = this.errorText;
+      note.classList.add("error-note");
+    } else if (this.allMasters) {
       note.textContent = editable.length
         ? "Margini e larghezza cambiano in tutti i master."
         : "Qui non c'è un master: i valori sono interpolati. Margini e larghezza cambiano in tutti i master.";
@@ -1884,9 +1925,24 @@ class OverviewMetrics {
       else await this.commitMetric(id, text, input, names);
     } catch (error) {
       console.error("[Testi di kerning]", error);
-      input.classList.add("error");
+      this.showError(input, `Non è stato possibile applicare il valore: ${error?.message || error}`);
     }
     this.scheduleRefresh();
+  }
+
+  // Il campo diventa rosso e sotto compare il motivo, per qualche secondo
+  showError(input, text) {
+    input?.classList.add("error");
+    this.errorText = text;
+    this.errorUntil = Date.now() + 12000;
+    const note = this.element.$("#note");
+    note.textContent = text;
+    note.classList.add("error-note");
+    clearTimeout(this.errorTimer);
+    this.errorTimer = setTimeout(() => {
+      this.errorText = null;
+      this.scheduleRefresh();
+    }, 12000);
   }
 
   // I livelli da modificare: solo il master scelto in Source, o tutti i master
@@ -1929,7 +1985,7 @@ class OverviewMetrics {
     const relative = isRelativeInput(text);
     const absolute = relative ? null : evaluateInput(text, null);
     if (!relative && absolute === null) {
-      input.classList.add("error");
+      this.showError(input, `«${text}» non è un valore valido: scrivi un numero (40), un calcolo (590/2) o un'operazione (+10, --10, *2, /2).`);
       return;
     }
     // Un valore: uguale per tutti. Un'operazione: dal valore di ogni glifo e master.
@@ -1988,8 +2044,7 @@ class OverviewMetrics {
     if (this.fc.readOnly) return;
     const groupName = String(text).trim();
     if (groupName && !GROUP_NAME.test(groupName)) {
-      input.classList.add("error");
-      input.title = "Nome di gruppo non valido: usa lettere, numeri, punto, trattino e trattino basso.";
+      this.showError(input, `«${groupName}» non è un nome di gruppo valido: usa lettere, numeri, punto, trattino e trattino basso.`);
       return;
     }
     if (!names.length) return;

@@ -84,6 +84,7 @@ Tutti i campi si possono modificare. Si conferma con **Invio**, con **Tab** o us
 - **↑ / ↓** nei margini e nella larghezza: ±1, con **⇧** ±10.
 - **Riscrivere il valore già mostrato, o premere Invio senza cambiarlo, lo applica**, come nella Barra info. Con **Tutti i master** acceso è il modo più veloce per allineare i master: se il Regular mostra 30, Invio dà 30 anche agli altri. Entrare in un campo e uscire senza scrivere non cambia niente.
 - Se dopo aver scritto clicchi un altro glifo, il valore va ai glifi su cui stavi scrivendo, non a quello appena cliccato.
+- Se un valore non può essere applicato, il campo diventa rosso e sotto compare il motivo in rosso per qualche secondo.
 - **Margine sinistro**: sposta tutto il disegno, ancore e componenti compresi, come in Glyphs. **Larghezza**: cambia lo spazio a destra. **Margine destro**: cambia la larghezza.
 - **Gruppo**: scrivi il nome per mettere i glifi selezionati in quel gruppo (se non c'è, viene creato). Svuota il campo per toglierli dal gruppo. Con il plugin "Ancore e accentate", le accentate seguono la loro lettera base.
 - **⌘Z** annulla.
@@ -103,8 +104,8 @@ Come per gli altri plugin, la sezione compare nella panoramica dopo che hai aper
 
 1. Crea un repository **pubblico** su GitHub, per esempio `fontra-kerning-texts`.
 2. Carica `plugin.json` e `kerning-texts.js` (va bene anche questo README) nella radice del repository.
-3. Crea una release con tag `v1.2.1`.
-4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.2.1`.
+3. Crea una release con tag `v1.2.2`.
+4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.2.2`.
 5. Ricarica l'editor.
 
-Per aggiornare da una versione precedente: crea la release `v1.2.1`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.
+Per aggiornare da una versione precedente: crea la release `v1.2.2`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.
