@@ -3,7 +3,8 @@
 Due strumenti per spaziatura e kerning, come in Glyphs:
 
 - **nell'editor**, un pannello con testi pronti per il kerning: scegli una lista e lavori una coppia alla volta, già selezionata nello strumento Kerning di Fontra;
-- **nella panoramica del font**, una sezione nella barra a sinistra con margini, larghezza e gruppi di kerning dei glifi selezionati, anche di più glifi insieme.
+- **nella panoramica del font**, una sezione nella barra a sinistra con margini, larghezza e gruppi di kerning dei glifi selezionati, anche di più glifi insieme;
+- **per i font con più master**: il kerning in più master insieme, i master intermedi calcolati dagli angoli e un controllo del kerning (eccezioni, valori rimasti senza gruppo, master vuoti).
 
 ## Aprire il pannello
 
@@ -16,7 +17,7 @@ Menu **View → Testi di kerning**, oppure **⌥⌘K** (Ctrl+Alt+K su Windows e 
 3. **← →** cambiano il valore di 1, con **⇧** di 10, con **⌥** di 5 (sono i comandi dello strumento Kerning di Fontra).
 4. **↓** passa alla coppia successiva, **↑** alla precedente. Puoi anche cliccare una voce della lista.
 
-Le coppie che hai già passato restano **spuntate** (✓) e il contatore dice quante ne hai viste. **Riprendi** torna alla prima coppia non ancora vista; **Azzera spunte** ricomincia la lista. Le spunte sono salvate per ogni font, e il pannello ricorda a che punto eri di ogni lista.
+Le coppie che hai già passato restano **spuntate** (✓) e il contatore dice quante ne hai viste. Le spunte valgono **per master**: il contatore mostra il master in cui sei (per esempio `viste 12 (BW)`), e una coppia vista nel Bold Wide non risulta vista nel Light. **Riprendi** torna alla prima coppia non ancora vista; **Azzera spunte** ricomincia la lista nel master in cui sei. Le spunte sono salvate per ogni font, e il pannello ricorda a che punto eri di ogni lista.
 
 - **Contesto**: le lettere di controllo intorno alla coppia. `HH nn 11` (dritte, il default), `OO oo 00` (tonde), `HO no 10` (miste) o nessuna. Per maiuscole, minuscole e cifre si usano quelle giuste: `HH Ta nn`, `nn ry nn`, `11 7. 11`.
 - **Per volta**: 1 coppia, oppure 10 o 30 righe insieme per vedere più coppie a colpo d'occhio. Anche così ↑ ↓ passano da una riga all'altra.
@@ -28,7 +29,8 @@ Sotto la lista il pannello mostra, per la coppia selezionata:
 - il **valore** di kerning nel master in cui ti trovi;
 - se il valore è **tra i gruppi**, **tra due glifi** o è un'**eccezione**;
 - i **gruppi** della coppia;
-- **a quali altre coppie vale lo stesso valore**: "Vale per 18 coppie: AC AĆ AČ AG…". Così sai subito cosa stai cambiando.
+- **a quali altre coppie vale lo stesso valore**: "Vale per 18 coppie: AC AĆ AČ AG…". Così sai subito cosa stai cambiando;
+- **il valore in tutti i master**, in una griglia: per DIESEL, peso (100, 400, 900) in verticale e larghezza (50, 100, 200) in orizzontale. Il master in cui sei è riquadrato; in azzurro i master a cui vanno le modifiche (vedi sotto). Un valore grigio è 0: lì la coppia non ha kerning.
 
 Per fare un'eccezione per una coppia sola, tasto destro sulla coppia nell'editor: è il comando di Fontra.
 
@@ -56,6 +58,61 @@ Nelle liste delle accentate invece le coppie non vengono unite per gruppo: servo
 
 **Le liste si adattano al font**: le coppie con glifi che il font non ha vengono saltate, e una nota sotto il pannello dice quali caratteri mancano. Le liste delle accentate e delle alternative si costruiscono dai glifi che il font ha davvero.
 
+## Kerning su più master
+
+Con 9 master ogni coppia va sistemata 9 volte. Il pannello ha tre strumenti per ridurre il lavoro.
+
+### Master: dove vanno le modifiche
+
+Sotto **Contesto** c'è il menu **Master**. Decide a quali master va lo spostamento fatto con ← →:
+
+| Scelta | ← → cambiano |
+|---|---|
+| **Solo il master in cui sei** (default) | solo quel master, come in Fontra |
+| **Tutti i master** | tutti e 9, con lo stesso spostamento: +5 aggiunge 5 a ogni master, partendo dal suo valore |
+| **Stesso peso del master in cui sei** | la riga della griglia: dal Light, i tre Light (Compact, normale, Wide) |
+| **Stessa larghezza del master in cui sei** | la colonna: dal Regular Wide, Light Wide, Regular Wide e Bold Wide |
+
+- Ogni master parte dal suo valore, e la coppia giusta (gruppo o eccezione) si sceglie master per master, come fa Fontra.
+- Un ⌘Z annulla lo spostamento in tutti i master insieme.
+- Vale solo con il pannello aperto e solo per le frecce: trascinando la coppia con il mouse cambia solo il master in cui sei.
+- Con più master, la coppia passata con ↓ risulta vista in tutti i master che hai modificato.
+
+### Master intermedi
+
+Il metodo più veloce: fai il kerning dei **4 angoli** (Light Compact, Light Wide, Bold Compact, Bold Wide) e fai calcolare gli altri.
+
+Ogni master intermedio si calcola dagli angoli in proporzione alla sua posizione su ogni asse. Per esempio il Light (peso 100, larghezza 100) sta a un terzo tra Light Compact e Light Wide, perché la larghezza va da 50 a 200.
+
+- **Questa coppia** (nel pannello, accanto a "Master intermedi"): solo la coppia selezionata.
+- **Tutto il font…**: tutte le coppie.
+
+Prima di cambiare qualcosa si apre una finestra con la tabella di tutte le coppie e di tutti i master: in blu i valori nuovi, barrati quelli di adesso. Due opzioni, tutte e due spente di default:
+
+- **Sovrascrivi anche i valori già messi**: se spenta, riempie solo i master vuoti e non tocca niente di quello che hai fatto.
+- **Calcola anche il Regular**: se spenta, il Regular (il master predefinito) resta come l'hai fatto tu. Il peso 400 non è a metà tra 100 e 900, quindi il Regular conviene farlo a mano.
+
+Gli angoli non vengono mai toccati. Una coppia a cui manca il valore in un angolo che serve viene saltata, e la finestra lo dice. **Applica** cambia tutto in un passo, che si annulla con ⌘Z.
+
+### Controlla kerning
+
+**Controlla kerning…** (in fondo al pannello, o nella panoramica) apre una finestra con tre elenchi. Ogni riga mostra i valori nei 9 master. Niente cambia finché non scegli e premi **Applica**, e tutto si annulla con ⌘Z.
+
+1. **Eccezioni che scavalcano un gruppo.** Una coppia scritta per un glifo singolo vince sul valore del suo gruppo: quando cambi il gruppo, questa coppia non cambia. Sotto ogni eccezione c'è il valore che avrebbe dal gruppo.
+   - **uguale al gruppo**: cancellandola non cambia niente di quello che vedi, e da lì in poi segue il gruppo. **Seleziona le uguali al gruppo** le spunta tutte insieme.
+   - **diversa**: in rosso i master dove è diversa dal gruppo. Spuntala solo se vuoi davvero che torni al valore del gruppo.
+2. **Valori legati a gruppi che non esistono più.** Quando un gruppo si svuota, Fontra non sposta il suo kerning: il valore resta nel file ma non vale per nessuna coppia. Per ognuno scegli:
+   - **Lascia così**;
+   - **Cancella**;
+   - **Sposta su …**: sul gruppo in cui si trova ora il glifo con lo stesso nome del gruppo (per esempio `@B @O` su `@O @O`, perché ora la B è nel gruppo destro della O). Il menu dice per quante coppie varrebbe: guardalo bene prima di sceglierlo;
+   - **Eccezione …**: tra i due glifi con lo stesso nome dei gruppi, quando esistono (per esempio `A V`).
+3. **Coppie con master vuoti.** In un master vuoto la coppia vale 0, quindi il kerning salta da un master all'altro. A volte è voluto, per esempio un valore che serve solo in Light Compact. Per ognuna scegli:
+   - **Lascia così**;
+   - **Riempi i vuoti dagli angoli**: sotto la riga vedi i valori che verrebbero messi;
+   - **Metti … nei vuoti**: quando i master che hanno un valore hanno tutti lo stesso.
+
+   Le eccezioni non compaiono qui: in un'eccezione un master vuoto vuol dire "usa il valore del gruppo", ed è giusto così.
+
 ## Un ordine di lavoro consigliato
 
 1. **Spaziatura**: sistema i margini finché le righe di controllo sono uniformi.
@@ -64,6 +121,8 @@ Nelle liste delle accentate invece le coppie non vengono unite per gruppo: servo
 4. **Punteggiatura e virgolette**, **numeri**.
 5. **Tutte le coppie** per non lasciare buchi.
 6. **Accentate e casi limite**, **Italiano**, **Altre lingue**: per controllare il risultato e fare le eccezioni.
+
+Con più master: fai i passi 3–5 sui 4 angoli, poi **Master intermedi → Tutto il font…**, poi sistema il Regular a mano. Ogni tanto usa **Controlla kerning** per togliere le eccezioni rimaste uguali al gruppo.
 
 ## Margini e gruppi nella panoramica
 
@@ -122,6 +181,8 @@ Sotto i campi c'è l'interruttore **Tutti i master**, acceso di default (la scel
 
 I **gruppi di kerning** valgono sempre per tutti i master: in Fontra, come in Glyphs, il gruppo è del glifo, non del singolo master.
 
+Sotto la sezione ci sono anche **Controlla kerning…** e **Master intermedi…**: sono le stesse finestre del pannello (vedi "Kerning su più master"), e anche qui si annullano con ⌘Z.
+
 Funziona con Fontra Pak 2026.10 e successivi.
 
 Come per gli altri plugin, la sezione compare nella panoramica dopo che hai aperto un glifo da lì (o dopo aver aperto la panoramica dal menu **Font** di un editor).
@@ -130,8 +191,8 @@ Come per gli altri plugin, la sezione compare nella panoramica dopo che hai aper
 
 1. Crea un repository **pubblico** su GitHub, per esempio `fontra-kerning-texts`.
 2. Carica `plugin.json` e `kerning-texts.js` (va bene anche questo README) nella radice del repository.
-3. Crea una release con tag `v1.4.0`.
-4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.4.0`.
+3. Crea una release con tag `v1.5.0`.
+4. In Fontra apri **Fontra → Plugin Manager**, premi **+** e scrivi `https://cdn.jsdelivr.net/gh/TUONOME/fontra-kerning-texts@v1.5.0`.
 5. Ricarica l'editor.
 
-Per aggiornare da una versione precedente: crea la release `v1.4.0`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.
+Per aggiornare da una versione precedente: crea la release `v1.5.0`, rimuovi dal Plugin Manager l'indirizzo con il tag vecchio e aggiungi quello nuovo.

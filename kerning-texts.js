@@ -740,6 +740,13 @@ const CSS = `
   .info .value { font-variant-numeric: tabular-nums; }
   .info .muted, .hint { opacity: 0.6; font-size: 11px; }
   .counter { margin-left: auto; opacity: 0.7; font-variant-numeric: tabular-nums; }
+  .mgrid { border-collapse: collapse; margin-top: 4px; font-variant-numeric: tabular-nums; font-size: 11.5px; }
+  .mgrid th { font-weight: normal; opacity: 0.55; padding: 1px 5px; text-align: right; }
+  .mgrid td { padding: 1px 5px; text-align: right; border-radius: 4px; }
+  .mgrid td.zero { opacity: 0.4; }
+  .mgrid td.target { background: #3b82f622; }
+  .mgrid td.current { outline: 1.5px solid #3b82f6; font-weight: bold; }
+  .small { font-size: 11px; padding: 2px 6px; }
   [hidden] { display: none !important; }
 `;
 
@@ -774,6 +781,10 @@ class KerningTextsPanel extends HTMLElement {
             <span class="label">Per volta</span>
             <select id="per-page" style="flex:none; width:56px"><option>1</option><option>10</option><option>30</option></select>
           </div>
+          <div class="row">
+            <span class="label">Master</span>
+            <select id="master-mode" title="Dove vanno le modifiche fatte con ← →"></select>
+          </div>
           <div class="list" id="items"></div>
           <div class="row">
             <button class="button" id="prev" title="Coppia precedente (↑)">↑ Prec.</button>
@@ -782,12 +793,18 @@ class KerningTextsPanel extends HTMLElement {
             <span class="counter" id="counter"></span>
           </div>
           <div class="info" id="info"></div>
+          <div class="row">
+            <span class="label">Master intermedi</span>
+            <button class="button small" id="interp-pair" title="Calcola dagli angoli i master intermedi di questa coppia (prima vedi cosa cambia)">Questa coppia</button>
+            <button class="button small" id="interp-all" title="Calcola dagli angoli i master intermedi di tutte le coppie (prima vedi cosa cambia)">Tutto il font…</button>
+          </div>
           <div class="row hint">
-            <span>← → regolano (⇧ ×10, ⌥ ×5) · ↑ ↓ coppia · tasto destro sulla coppia: eccezione</span>
+            <span>← → regolano (⇧ ×10, ⌥ ×5) nei master scelti sopra · ↑ ↓ coppia · tasto destro sulla coppia: eccezione</span>
           </div>
           <div class="row hint">
             <span id="hidden-note" style="flex:1"></span>
-            <button class="button" id="reset-done" title="Togli le spunte da questa lista">Azzera spunte</button>
+            <button class="button small" id="check" title="Eccezioni, valori senza gruppo, master vuoti">Controlla kerning…</button>
+            <button class="button small" id="reset-done" title="Togli le spunte da questa lista, nel master in cui sei">Azzera spunte</button>
           </div>
         </div>
       </div>`;
@@ -808,7 +825,7 @@ class KerningTextsPlugin {
     MetricsKeysEngine.install(this.fc);
     this.settings = {
       open: false, category: "Maiuscole", list: "uc-classic", context: "straight",
-      perPage: 1, x: null, y: null, letter: "T", side: "both", current: {},
+      perPage: 1, x: null, y: null, letter: "T", side: "both", current: {}, masterMode: "this",
       ...loadJSON(SETTINGS_KEY, {}),
     };
     this.items = [];
@@ -836,6 +853,166 @@ class KerningTextsPlugin {
     this.fc.addChangeListener({ glyphMap: null }, () => {
       if (!this.panel.hidden) this.rebuild();
     }, false);
+    // Master aggiunti o tolti: si ricalcola la griglia
+    this.fc.addChangeListener({ sources: null }, () => this.loadGrid(), false);
+    this.fc.addChangeListener({ kerning: null }, (change) => {
+      if (JSON.stringify(change || {}).includes("sourceIdentifiers")) this.loadGrid();
+    }, false);
+    // Cambiando master le spunte e la griglia dei valori seguono
+    try {
+      this.editor.sceneSettingsController?.addKeyListener?.("fontLocationSourceMapped", () => {
+        if (this.panel.hidden) return;
+        this.renderList();
+        this.scheduleInfo();
+      });
+    } catch (error) {
+      // ignora
+    }
+    this.wrapKerningTool();
+  }
+
+  // --- più master -----------------------------------------------------------------
+
+  async loadGrid() {
+    try {
+      this.grid = await loadMasterGrid(this.fc);
+    } catch (error) {
+      console.warn("[Testi di kerning] Master:", error);
+      this.grid = null;
+    }
+    this.fillMasterModes();
+    if (!this.panel.hidden) this.renderList();
+    this.scheduleInfo();
+  }
+
+  fillMasterModes() {
+    const select = this.panel.$("#master-mode");
+    select.innerHTML = "";
+    const add = (value, text) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      select.appendChild(option);
+    };
+    add("this", "Solo il master in cui sei");
+    const axes = this.grid?.axes || [];
+    if (this.grid && this.grid.masters.length > 1) {
+      add("all", `Tutti i master (${this.grid.masters.filter((m) => m.inKerning).length})`);
+      if (axes.length > 1) {
+        for (const axis of axes) {
+          const label = axisLabel(axis.name);
+          const feminine = /a$|ione$|e ottica$/.test(label);
+          add(`axis:${axis.name}`, `Stess${feminine ? "a" : "o"} ${label} del master in cui sei`);
+        }
+      }
+    }
+    if (![...select.options].some((o) => o.value === this.settings.masterMode)) this.settings.masterMode = "this";
+    select.value = this.settings.masterMode;
+  }
+
+  currentLocation() {
+    const location = { ...(this.sc.sceneSettings.fontLocationSourceMapped || {}) };
+    for (const axis of this.grid?.axes || []) if (location[axis.name] === undefined) location[axis.name] = axis.def;
+    return location;
+  }
+
+  currentSourceId() {
+    try {
+      return this.fc.fontSourcesInstancer.getSourceIdentifierForLocation(this.sc.sceneSettings.fontLocationSourceMapped || {}, false) || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // I master a cui vanno le modifiche (null = solo quello in cui sei)
+  targetSourceIds() {
+    const mode = this.settings.masterMode || "this";
+    if (mode === "this" || !this.grid) return null;
+    const masters = this.grid.masters.filter((m) => m.inKerning);
+    if (mode === "all") return masters.map((m) => m.id);
+    if (mode.startsWith("axis:")) {
+      const axisName = mode.slice(5);
+      const value = this.currentLocation()[axisName];
+      const ids = masters.filter((m) => m.location[axisName] === value).map((m) => m.id);
+      return ids.length ? ids : null;
+    }
+    return null;
+  }
+
+  // ← → dello strumento Kerning: con "Tutti i master" (o una riga/colonna) lo
+  // stesso spostamento va a ogni master scelto, in un solo passo di annullamento
+  wrapKerningTool() {
+    const tool = this.editor.tools?.[KERNING_TOOL];
+    if (!tool || tool.__kerningTextsWrapped || typeof tool.handleArrowKeys !== "function") return;
+    tool.__kerningTextsWrapped = true;
+    const original = tool.handleArrowKeys.bind(tool);
+    tool.handleArrowKeys = async (event) => {
+      const targets = this.panel.hidden ? null : this.targetSourceIds();
+      if (!targets || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return original(event);
+      if (!tool.sceneSettings?.applyTextShaping || !tool.selectedHandles?.length) return original(event);
+      try {
+        await this.editInMasters(tool, event, targets);
+      } catch (error) {
+        console.error("[Testi di kerning] Kerning su più master:", error);
+      }
+    };
+  }
+
+  async editInMasters(tool, event, targets) {
+    const kc = tool.kerningController || this.kc || (await this.fc.getKerningController("kern"));
+    if (!kc) return;
+    const delta = (event.key === "ArrowLeft" ? -1 : 1) * (tool.getStepValue?.(event) ?? (event.shiftKey ? 10 : event.altKey ? 5 : 1));
+    const selectors = [];
+    const newValues = [];
+    const seen = new Set();
+    for (const handle of tool.selectedHandles) {
+      const { leftGlyph, rightGlyph } = tool.getGlyphNamesFromSelector(handle.selector);
+      for (const sourceIdentifier of targets) {
+        const { leftName, rightName } = kc.getPairNames(leftGlyph, rightGlyph, sourceIdentifier);
+        const key = `${leftName} ${rightName} ${sourceIdentifier}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        selectors.push({ leftName, rightName, sourceIdentifier });
+        newValues.push((kc.getPairValueForSource(leftName, rightName, sourceIdentifier) || 0) + delta);
+      }
+    }
+    if (!selectors.length) return;
+    tool.updateScrollAdjustBehavior?.();
+    const label = `kerning (${targets.length} master)`;
+    const changes = await kc.getEditContext(selectors).edit(newValues, label, event);
+    tool.pushUndoItem(changes, label);
+    this.scheduleInfo();
+  }
+
+  // Modifiche della finestra "Controlla kerning" / "Master intermedi"
+  async applyKerning(builder, label) {
+    const { change, rollbackChange } = builder.build(label);
+    await this.fc.applyChange(change);
+    await this.fc.postChange(change, rollbackChange, label);
+    try {
+      this.kc?.clearCaches?.();
+      this.editor.tools?.[KERNING_TOOL]?.pushUndoItem?.({ change, rollbackChange }, label);
+    } catch (error) {
+      // l'annullamento resta quello di Fontra
+    }
+    this.scheduleInfo();
+  }
+
+  openKerningDialog(mode, options = {}) {
+    const dialog = new KerningToolsDialog({ fc: this.fc, apply: (builder, label) => this.applyKerning(builder, label) }, mode, options);
+    dialog.open();
+  }
+
+  interpolateCurrentPair() {
+    const item = this.items[this.current];
+    if (!item || item.type !== "pair" || !this.kc) return;
+    const { leftName, rightName } = this.kc.getPairNames(item.left, item.right);
+    const exists = this.kc.getPairValues(leftName, rightName);
+    const label = `${this.view.label(item.left)}${this.view.label(item.right)}`;
+    this.openKerningDialog("interpolate", {
+      pairs: exists ? [[leftName, rightName]] : [],
+      title: `Master intermedi di ${label} (${leftName} ${rightName})`,
+    });
   }
 
   get view() {
@@ -901,6 +1078,8 @@ class KerningTextsPlugin {
     this.placePanel();
     this.fillCategories();
     this.rebuild();
+    this.wrapKerningTool();
+    this.loadGrid();
   }
 
   close() {
@@ -1011,10 +1190,28 @@ class KerningTextsPlugin {
       this.select(index >= 0 ? index : 0);
     });
     $("#reset-done").addEventListener("click", () => {
-      delete this.done[this.settings.list];
+      // Le spunte vecchie (di prima della 1.5) valevano per tutti i master:
+      // restano agli altri master e si tolgono solo da questo
+      const legacy = this.done[this.settings.list];
+      if (legacy) {
+        for (const master of this.grid?.masters || []) {
+          const key = this.doneKey(master.id);
+          this.done[key] = [...new Set([...(this.done[key] || []), ...legacy])];
+        }
+        delete this.done[this.settings.list];
+      }
+      delete this.done[this.doneKey(this.currentSourceId())];
       this.saveDone();
       this.renderList();
     });
+    $("#master-mode").addEventListener("change", () => {
+      this.settings.masterMode = $("#master-mode").value;
+      this.saveSettings();
+      this.scheduleInfo();
+    });
+    $("#interp-pair").addEventListener("click", () => this.interpolateCurrentPair());
+    $("#interp-all").addEventListener("click", () => this.openKerningDialog("interpolate"));
+    $("#check").addEventListener("click", () => this.openKerningDialog("check"));
   }
 
   fillCategories() {
@@ -1083,8 +1280,13 @@ class KerningTextsPlugin {
     this.show();
   }
 
+  // Le spunte valgono per master: "viste" nel Bold non vuol dire viste nel Light
+  doneKey(sourceId) {
+    return `${this.settings.list}|${sourceId || "?"}`;
+  }
+
   doneSet() {
-    return new Set(this.done[this.settings.list] || []);
+    return new Set([...(this.done[this.settings.list] || []), ...(this.done[this.doneKey(this.currentSourceId())] || [])]);
   }
 
   saveDone() {
@@ -1093,12 +1295,17 @@ class KerningTextsPlugin {
 
   markDone(item) {
     if (!item) return;
-    const list = this.done[this.settings.list] || (this.done[this.settings.list] = []);
     const key = itemKey(item);
-    if (!list.includes(key)) {
-      list.push(key);
-      this.saveDone();
+    let changed = false;
+    for (const sourceId of this.targetSourceIds() || [this.currentSourceId()]) {
+      const doneKey = this.doneKey(sourceId);
+      const list = this.done[doneKey] || (this.done[doneKey] = []);
+      if (!list.includes(key)) {
+        list.push(key);
+        changed = true;
+      }
     }
+    if (changed) this.saveDone();
   }
 
   itemLabel(item) {
@@ -1159,9 +1366,12 @@ class KerningTextsPlugin {
   updateCounter() {
     const doneSet = this.doneSet();
     const done = this.items.filter((item) => doneSet.has(itemKey(item))).length;
+    const sourceId = this.currentSourceId();
+    const master = this.grid?.masters.find((m) => m.id === sourceId);
     this.panel.$("#counter").textContent = this.items.length
-      ? `${this.current + 1} / ${this.items.length} · viste ${done}`
+      ? `${this.current + 1} / ${this.items.length} · viste ${done}${master ? ` (${master.short})` : ""}`
       : "";
+    this.panel.$("#counter").title = master ? `Coppie viste nel master ${master.name}` : "";
   }
 
   step(direction) {
@@ -1380,7 +1590,732 @@ class KerningTextsPlugin {
       `<b>${escapeHTML(view.label(left) + view.label(right))}</b>  <span class="muted">${escapeHTML(left)} ${escapeHTML(right)}</span><br>` +
       `Valore <span class="value"><b>${valueText}</b></span> · ${kind}<br>` +
       `<span class="muted">Gruppi: ${groupText}</span>` +
-      coverage;
+      coverage +
+      this.masterGridHTML(left, right);
+  }
+
+  // I valori della coppia in tutti i master. Riquadrato il master in cui sei,
+  // in azzurro quelli a cui vanno le modifiche.
+  masterGridHTML(left, right) {
+    const grid = this.grid;
+    const kc = this.kc;
+    if (!grid || !kc || grid.masters.length < 2) return "";
+    const currentId = this.currentSourceId();
+    const targets = new Set(this.targetSourceIds() || (currentId ? [currentId] : []));
+    const cell = (master) => {
+      if (!master) return "<td></td>";
+      let value = null;
+      try {
+        value = master.inKerning ? kc.getGlyphPairValueForSource(left, right, master.id) : null;
+      } catch (error) {
+        value = null;
+      }
+      const v = value === null || value === undefined ? 0 : Math.round(value);
+      const classes = [v === 0 ? "zero" : "", targets.has(master.id) ? "target" : "", master.id === currentId ? "current" : ""].join(" ");
+      return `<td class="${classes}" title="${escapeHTML(master.name)}">${v}</td>`;
+    };
+    if (grid.axes.length === 2) {
+      const [a, b] = grid.axes;
+      const rows = [...new Set(grid.masters.map((m) => m.location[a.name]))].sort((x, y) => x - y);
+      const cols = [...new Set(grid.masters.map((m) => m.location[b.name]))].sort((x, y) => x - y);
+      if (rows.length * cols.length <= 30) {
+        let html = `<table class="mgrid"><tr><th title="${escapeHTML(axisLabel(a.name))} ↓  ${escapeHTML(axisLabel(b.name))} →">${escapeHTML(axisLabel(a.name).slice(0, 4))}·${escapeHTML(axisLabel(b.name).slice(0, 4))}</th>`;
+        html += cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
+        for (const r of rows) {
+          html += `<tr><th>${r}</th>`;
+          for (const c of cols) html += cell(grid.masters.find((m) => m.location[a.name] === r && m.location[b.name] === c));
+          html += "</tr>";
+        }
+        return html + "</table>";
+      }
+    }
+    return `<table class="mgrid"><tr>${grid.masters.map((m) => `<th title="${escapeHTML(m.name)}">${escapeHTML(m.short)}</th>`).join("")}</tr><tr>${grid.masters.map(cell).join("")}</tr></table>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kerning su più master: la griglia dei master, i master intermedi calcolati
+// dagli angoli e il controllo del kerning (eccezioni, valori senza gruppo,
+// master vuoti). Usato dal pannello nell'editor e dalla panoramica.
+// ---------------------------------------------------------------------------
+
+const KERN_TAG = "kern";
+const AXIS_LABELS = {
+  weight: "peso", wght: "peso", width: "larghezza", wdth: "larghezza",
+  "optical size": "dimensione ottica", opsz: "dimensione ottica", slant: "inclinazione", italic: "corsivo",
+};
+
+function axisLabel(name) {
+  return AXIS_LABELS[String(name).toLowerCase()] || name;
+}
+
+// I master del font in ordine di griglia, con la posizione di ognuno tra il
+// minimo e il massimo di ogni asse (da 0 a 1) e quali sono gli angoli.
+async function loadMasterGrid(fontController) {
+  const kerning = await loadKerning(fontController);
+  const table = kerning?.[KERN_TAG] || null;
+  let sources = {};
+  try {
+    sources = (await fontController.getSources?.()) || fontController.sources || {};
+  } catch (error) {
+    sources = fontController.sources || {};
+  }
+  const axes = (fontController.fontAxesSourceSpace || [])
+    .filter((axis) => axis.minValue !== axis.maxValue)
+    .map((axis) => ({ name: axis.name, min: axis.minValue, max: axis.maxValue, def: axis.defaultValue }));
+  const kernIds = table?.sourceIdentifiers || [];
+  const defaultLocation = Object.fromEntries(axes.map((axis) => [axis.name, axis.def]));
+  const masters = [];
+  for (const [id, source] of Object.entries(sources)) {
+    if (source.isSparse || source.inactive) continue;
+    const location = { ...defaultLocation, ...(source.location || {}) };
+    const t = {};
+    for (const axis of axes) t[axis.name] = (location[axis.name] - axis.min) / (axis.max - axis.min);
+    masters.push({
+      id,
+      name: source.name || id,
+      location,
+      t,
+      inKerning: kernIds.includes(id),
+      isDefault: axes.every((axis) => location[axis.name] === axis.def),
+      isCorner: axes.length > 0 && axes.every((axis) => location[axis.name] === axis.min || location[axis.name] === axis.max),
+    });
+  }
+  masters.sort((a, b) => {
+    for (const axis of axes) {
+      const d = a.location[axis.name] - b.location[axis.name];
+      if (d) return d;
+    }
+    return 0;
+  });
+  // Nomi brevi: le iniziali ("Light Compact" → LC)
+  const used = new Set();
+  for (const master of masters) {
+    let short = master.name.split(/[\s_\-]+/).filter(Boolean).map((w) => w[0].toUpperCase()).join("") || master.name;
+    if (used.has(short)) short = master.name;
+    used.add(short);
+    master.short = short;
+  }
+  const cornerKey = (m) => axes.map((axis) => (m.location[axis.name] === axis.max ? 1 : 0)).join("");
+  const corners = [];
+  const seen = new Set();
+  for (const master of masters) {
+    if (!master.isCorner || !master.inKerning || seen.has(cornerKey(master))) continue;
+    seen.add(cornerKey(master));
+    corners.push(master);
+  }
+  return {
+    axes,
+    masters,
+    corners,
+    complete: axes.length > 0 && corners.length === 2 ** axes.length,
+    table,
+    kernIds,
+    defaultMaster: masters.find((m) => m.isDefault) || null,
+  };
+}
+
+// Un master calcolato dagli angoli, in proporzione alla sua posizione su ogni asse
+function valueFromCorners(grid, valueOf, master) {
+  let sum = 0;
+  for (const corner of grid.corners) {
+    let weight = 1;
+    for (const axis of grid.axes) {
+      const atMax = corner.location[axis.name] === axis.max;
+      const t = master.t[axis.name];
+      weight *= atMax ? t : 1 - t;
+    }
+    if (Math.abs(weight) < 1e-9) continue;
+    const value = valueOf(corner.id);
+    if (value === null || value === undefined) return null;
+    sum += weight * value;
+  }
+  return Math.round(sum);
+}
+
+function pairValueGetter(grid, values) {
+  return (id) => {
+    const index = grid.kernIds.indexOf(id);
+    return index < 0 ? null : values?.[index] ?? null;
+  };
+}
+
+// Cosa cambierebbe calcolando i master intermedi delle coppie indicate
+// (tutte, se pairs non c'è). Gli angoli non si toccano mai.
+function planInterpolation(grid, { pairs = null, overwrite = false, includeDefault = false } = {}) {
+  const values = grid.table?.values || {};
+  const list = pairs || Object.entries(values).flatMap(([left, row]) => Object.keys(row).map((right) => [left, right]));
+  const results = [];
+  let missingCorners = 0;
+  for (const [left, right] of list) {
+    const old = values[left]?.[right];
+    if (!old) continue;
+    const valueOf = pairValueGetter(grid, old);
+    const next = grid.kernIds.map((id, i) => old[i] ?? null);
+    const cells = [];
+    let missing = false;
+    for (const master of grid.masters) {
+      if (master.isCorner || !master.inKerning) continue;
+      if (master.isDefault && !includeDefault) continue;
+      const current = valueOf(master.id);
+      if (current !== null && !overwrite) continue;
+      const value = valueFromCorners(grid, valueOf, master);
+      if (value === null) {
+        missing = true;
+        continue;
+      }
+      if (current === value) continue;
+      next[grid.kernIds.indexOf(master.id)] = value;
+      cells.push({ id: master.id, from: current, to: value });
+    }
+    if (missing && !cells.length) missingCorners++;
+    if (cells.length) results.push({ left, right, old, next, cells });
+  }
+  return { results, missingCorners };
+}
+
+function kerningGroupMaps(table) {
+  const side1 = {};
+  const side2 = {};
+  for (const [group, members] of Object.entries(table?.groupsSide1 || {})) for (const m of members) side1[m] = group;
+  for (const [group, members] of Object.entries(table?.groupsSide2 || {})) for (const m of members) side2[m] = group;
+  return { side1, side2 };
+}
+
+// Le tre cose da controllare: eccezioni che scavalcano un gruppo, valori
+// legati a gruppi che non esistono più, coppie con master vuoti.
+function analyzeKerning(grid, glyphMap) {
+  const table = grid.table || { values: {}, groupsSide1: {}, groupsSide2: {} };
+  const values = table.values || {};
+  const { side1, side2 } = kerningGroupMaps(table);
+  const n = grid.kernIds.length;
+  const row = (arr) => Array.from({ length: n }, (_, i) => arr?.[i] ?? null);
+  const exceptions = [];
+  const orphans = [];
+  const incomplete = [];
+  const countMembers = (name, groups) => (name.startsWith("@") ? (groups[name.slice(1)] || []).length : 1);
+
+  for (const [left, rightValues] of Object.entries(values)) {
+    for (const [right, raw] of Object.entries(rightValues)) {
+      const own = row(raw);
+      const key = `${left} ${right}`;
+      const leftIsGroup = left.startsWith("@");
+      const rightIsGroup = right.startsWith("@");
+      const leftOrphan = leftIsGroup && !table.groupsSide1?.[left.slice(1)];
+      const rightOrphan = rightIsGroup && !table.groupsSide2?.[right.slice(1)];
+
+      // 1. Valori legati a gruppi che non esistono più
+      if (leftOrphan || rightOrphan) {
+        const options = [];
+        const namesake = (name, groups, map) => {
+          if (!name.startsWith("@")) return { group: name, glyph: name };
+          const groupName = name.slice(1);
+          if (groups[groupName]) return { group: name, glyph: glyphMap[groupName] !== undefined ? groupName : null };
+          if (glyphMap[groupName] === undefined) return { group: null, glyph: null };
+          return { group: map[groupName] ? `@${map[groupName]}` : groupName, glyph: groupName };
+        };
+        const l = namesake(left, table.groupsSide1 || {}, side1);
+        const r = namesake(right, table.groupsSide2 || {}, side2);
+        if (l.group && r.group && (l.group !== left || r.group !== right) && values[l.group]?.[r.group] === undefined) {
+          options.push({
+            kind: "move",
+            left: l.group,
+            right: r.group,
+            count: countMembers(l.group, table.groupsSide1 || {}) * countMembers(r.group, table.groupsSide2 || {}),
+          });
+        }
+        const sameAsMove = options.some((o) => o.left === l.glyph && o.right === r.glyph);
+        if (l.glyph && r.glyph && !sameAsMove && (l.glyph !== l.group || r.glyph !== r.group) && values[l.glyph]?.[r.glyph] === undefined) {
+          options.push({ kind: "exception", left: l.glyph, right: r.glyph, count: 1 });
+        }
+        orphans.push({
+          key, left, right, own,
+          missing: [leftOrphan ? `${left} (lato sinistro)` : null, rightOrphan ? `${right} (lato destro)` : null].filter(Boolean),
+          options,
+        });
+        continue;
+      }
+
+      // 2. Eccezioni: un glifo che ha un gruppo, usato da solo
+      const leftGroup = !leftIsGroup && side1[left] ? `@${side1[left]}` : null;
+      const rightGroup = !rightIsGroup && side2[right] ? `@${side2[right]}` : null;
+      if (leftGroup || rightGroup) {
+        const chain = [];
+        if (rightGroup) chain.push([left, rightGroup]);
+        if (leftGroup) chain.push([leftGroup, right]);
+        if (leftGroup && rightGroup) chain.push([leftGroup, rightGroup]);
+        const fallback = Array.from({ length: n }, (_, i) => {
+          for (const [l, r] of chain) {
+            const v = values[l]?.[r]?.[i];
+            if (v !== null && v !== undefined) return v;
+          }
+          return null;
+        });
+        const fallbackPair = chain.find(([l, r]) => values[l]?.[r]) || chain[chain.length - 1];
+        const differs = own.map((v, i) => v !== null && v !== (fallback[i] ?? 0));
+        exceptions.push({
+          key, left, right, own, fallback,
+          fallbackLabel: `${fallbackPair[0]} ${fallbackPair[1]}`,
+          same: !differs.some(Boolean),
+          differs,
+        });
+        continue;
+      }
+
+      // 3. Master vuoti (solo per le coppie che non sono eccezioni: in
+      // un'eccezione un master vuoto vuol dire "usa il gruppo")
+      const empty = own.map((v) => v === null);
+      // (se dove c'è il valore è sempre 0, la coppia non fa niente: non serve riempirla)
+      if (empty.some(Boolean) && !empty.every(Boolean) && own.some((v) => v)) {
+        const valueOf = pairValueGetter(grid, own);
+        const fromCorners = grid.kernIds.map((id, i) => {
+          if (own[i] !== null) return null;
+          const master = grid.masters.find((m) => m.id === id);
+          if (!master || master.isCorner || !grid.complete) return null;
+          return valueFromCorners(grid, valueOf, master);
+        });
+        const canCorners = grid.complete && own.some((v, i) => v === null && fromCorners[i] !== null);
+        const present = own.filter((v) => v !== null);
+        const common = present.every((v) => v === present[0]) ? present[0] : null;
+        incomplete.push({ key, left, right, own, empty, fromCorners, canCorners, common });
+      }
+    }
+  }
+  exceptions.sort((a, b) => Number(b.same) - Number(a.same));
+  return { exceptions, orphans, incomplete };
+}
+
+// Scrittura nella tabella "kern" (con annullamento)
+function setPairValues(builder, table, left, right, next) {
+  const base = ["kerning", KERN_TAG, "values"];
+  builder._createdRows = builder._createdRows || new Set();
+  if (!table.values?.[left] && !builder._createdRows.has(left)) {
+    builder.set(base, left, {}, undefined);
+    builder._createdRows.add(left);
+  }
+  builder.set([...base, left], right, next, clone(table.values?.[left]?.[right]));
+}
+
+function deletePairValues(builder, table, left, right) {
+  const old = table.values?.[left]?.[right];
+  if (old === undefined) return;
+  builder.delete(["kerning", KERN_TAG, "values", left], right, clone(old));
+}
+
+// Come si legge una coppia: "T z" con i nomi dei gruppi, e i caratteri se ci sono
+function pairLabel(glyphMap, left, right) {
+  const show = (name) => {
+    if (name.startsWith("@")) return name;
+    const cp = glyphMap[name]?.[0];
+    return cp !== undefined && name.length > 1 ? `${name} ${String.fromCodePoint(cp)}` : name;
+  };
+  return `${show(left)}  ${show(right)}`;
+}
+
+const DIALOG_TAG = "fontra-kerning-tools-dialog";
+const DIALOG_CSS = `
+  :host { all: initial; }
+  .overlay {
+    position: fixed; inset: 0; z-index: 1000; background: #0006;
+    display: flex; align-items: center; justify-content: center;
+    font-family: fontra-ui-regular, -apple-system, system-ui, sans-serif; font-size: 12px;
+  }
+  .box {
+    background: var(--ui-element-background-color, #fff); color: var(--ui-element-foreground-color, #222);
+    border-radius: 10px; box-shadow: 0 10px 40px #0006; width: min(1080px, 95vw); max-height: 90vh;
+    display: flex; flex-direction: column;
+  }
+  .head { display: flex; align-items: center; gap: 8px; padding: 12px 16px 4px; }
+  .head b { font-size: 14px; }
+  .head .x { margin-left: auto; border: none; font-size: 18px; opacity: 0.6; padding: 0 6px; }
+  .content { overflow: auto; padding: 0 16px 10px; }
+  .foot { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid #8883; }
+  .foot .msg { flex: 1; opacity: 0.8; }
+  h3 { font-size: 12.5px; margin: 16px 0 2px; }
+  p { margin: 3px 0 6px; line-height: 1.45; opacity: 0.8; }
+  .toolbar { display: flex; gap: 6px; align-items: center; margin: 4px 0 6px; flex-wrap: wrap; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 2px 6px; text-align: right; white-space: nowrap; border-bottom: 1px solid #8882; }
+  th { font-weight: normal; opacity: 0.65; }
+  .l { text-align: left; }
+  td.pair { font-weight: bold; }
+  td.muted, span.muted { opacity: 0.55; }
+  td.empty { opacity: 0.3; }
+  td.diff { color: #e03131; font-weight: bold; }
+  td.new { color: #2563eb; font-weight: bold; }
+  td.new s { color: inherit; opacity: 0.45; font-weight: normal; margin-right: 3px; }
+  tr.sub td { opacity: 0.6; }
+  tr.first td { border-top: 1px solid #8884; }
+  .tag { font-size: 10.5px; padding: 1px 7px; border-radius: 9px; background: #8882; }
+  .tag.same { background: #16a34a22; color: #15803d; }
+  .tag.diff { background: #e0313122; color: #c92a2a; }
+  button, select {
+    font: inherit; color: inherit; border-radius: 5px; border: 1px solid #8884;
+    background: transparent; padding: 3px 9px; cursor: pointer;
+  }
+  select { background: var(--text-input-background-color, #f2f2f2); padding: 2px 4px; }
+  button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  label.opt { display: flex; gap: 6px; align-items: center; margin: 3px 0; }
+  .none { opacity: 0.6; margin: 4px 0 8px; }
+`;
+
+class KerningToolsDialogElement extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this.shadowRoot.innerHTML = `
+      <style>${DIALOG_CSS}</style>
+      <div class="overlay">
+        <div class="box">
+          <div class="head"><b id="title"></b><button class="x" id="close" title="Chiudi (Esc)">×</button></div>
+          <div class="content" id="content"></div>
+          <div class="foot"><span class="msg" id="msg"></span><button id="cancel">Chiudi</button><button class="primary" id="apply">Applica</button></div>
+        </div>
+      </div>`;
+    this.$ = (sel) => this.shadowRoot.querySelector(sel);
+  }
+}
+if (!customElements.get(DIALOG_TAG)) customElements.define(DIALOG_TAG, KerningToolsDialogElement);
+
+// host: { fc, apply(builder, label) }
+// mode: "check" (Controlla kerning) o "interpolate" (master intermedi)
+class KerningToolsDialog {
+  constructor(host, mode, { pairs = null, title = null } = {}) {
+    this.host = host;
+    this.fc = host.fc;
+    this.mode = mode;
+    this.pairs = pairs;
+    this.title = title;
+    this.options = { overwrite: false, includeDefault: false };
+    this.selected = new Set();
+    this.choices = new Map();
+  }
+
+  async open() {
+    this.element = document.createElement(DIALOG_TAG);
+    document.body.appendChild(this.element);
+    const $ = this.element.$;
+    const close = () => this.close();
+    $("#close").addEventListener("click", close);
+    $("#cancel").addEventListener("click", close);
+    $(".overlay").addEventListener("pointerdown", (event) => {
+      if (event.target === $(".overlay")) close();
+    });
+    this.element.addEventListener("keydown", (event) => event.stopPropagation());
+    this.onKey = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      close();
+    };
+    window.addEventListener("keydown", this.onKey, true);
+    $("#apply").addEventListener("click", () => this.apply());
+    $("#title").textContent =
+      this.title || (this.mode === "check" ? "Controlla kerning" : "Calcola i master intermedi");
+    await this.reload();
+    $("#apply").focus();
+  }
+
+  close() {
+    window.removeEventListener("keydown", this.onKey, true);
+    this.element?.remove();
+    this.element = null;
+  }
+
+  async reload() {
+    this.grid = await loadMasterGrid(this.fc);
+    this.render();
+  }
+
+  masterHeader(extraLeft = 1) {
+    return `<tr>${"<th></th>".repeat(extraLeft)}${this.grid.masters
+      .map((m) => `<th title="${escapeHTML(m.name)}">${escapeHTML(m.short)}</th>`)
+      .join("")}</tr>`;
+  }
+
+  valueCells(values, { classFor = () => "" } = {}) {
+    const valueOf = pairValueGetter(this.grid, values);
+    return this.grid.masters
+      .map((m) => {
+        const v = valueOf(m.id);
+        const extra = classFor(m, v);
+        return v === null ? `<td class="empty ${extra}">·</td>` : `<td class="${extra}">${v}</td>`;
+      })
+      .join("");
+  }
+
+  render() {
+    if (!this.element) return;
+    const content = this.element.$("#content");
+    if (!this.grid.table) {
+      content.innerHTML = `<p>Il font non ha ancora una tabella di kerning.</p>`;
+      this.element.$("#apply").disabled = true;
+      return;
+    }
+    if (this.mode === "check") this.renderCheck(content);
+    else this.renderInterpolate(content);
+  }
+
+  // --- master intermedi ---------------------------------------------------------
+
+  renderInterpolate(content) {
+    const grid = this.grid;
+    const $ = this.element.$;
+    if (!grid.complete) {
+      content.innerHTML = `<p>Per calcolare i master intermedi servono i master negli angoli dello spazio di design (per esempio Light Compact, Light Wide, Bold Compact, Bold Wide): questo font non li ha tutti.</p>`;
+      $("#apply").disabled = true;
+      return;
+    }
+    const defaultName = grid.defaultMaster?.name || "Regular";
+    const plan = planInterpolation(grid, { pairs: this.pairs, ...this.options });
+    this.plan = plan;
+    const cornerNames = grid.corners.map((m) => m.name).join(", ");
+    const cells = plan.results.reduce((sum, r) => sum + r.cells.length, 0);
+    const changed = new Set();
+    let rows = "";
+    for (const result of plan.results) {
+      const byId = new Map(result.cells.map((c) => [c.id, c]));
+      const valueOf = pairValueGetter(grid, result.old);
+      rows +=
+        `<tr><td class="l pair">${escapeHTML(pairLabel(this.fc.glyphMap, result.left, result.right))}</td>` +
+        grid.masters
+          .map((m) => {
+            const cell = byId.get(m.id);
+            if (cell) {
+              changed.add(m.id);
+              return `<td class="new">${cell.from === null ? "" : `<s>${cell.from}</s>`}${cell.to}</td>`;
+            }
+            const v = valueOf(m.id);
+            return v === null ? `<td class="empty">·</td>` : `<td class="${m.isCorner ? "" : "muted"}">${v}</td>`;
+          })
+          .join("") +
+        `</tr>`;
+    }
+    content.innerHTML =
+      `<p>Gli angoli (${escapeHTML(cornerNames)}) restano come sono. Gli altri master si calcolano dagli angoli, in proporzione alla loro posizione su ogni asse. In blu i valori nuovi; barrati quelli di adesso.</p>` +
+      `<label class="opt"><input type="checkbox" id="overwrite" ${this.options.overwrite ? "checked" : ""}> Sovrascrivi anche i valori già messi (se spento, riempie solo i master vuoti)</label>` +
+      `<label class="opt"><input type="checkbox" id="include-default" ${this.options.includeDefault ? "checked" : ""}> Calcola anche il ${escapeHTML(defaultName)} (se spento, il ${escapeHTML(defaultName)} resta come l'hai fatto)</label>` +
+      (plan.results.length
+        ? `<table><thead>${this.masterHeader()}</thead><tbody>${rows}</tbody></table>`
+        : `<p class="none">Niente da calcolare con queste opzioni.</p>`) +
+      (plan.missingCorners
+        ? `<p>${plan.missingCorners} ${plan.missingCorners === 1 ? "coppia è saltata" : "coppie sono saltate"}: manca il valore in almeno uno degli angoli che servono.</p>`
+        : "");
+    $("#overwrite").addEventListener("change", (e) => {
+      this.options.overwrite = e.target.checked;
+      this.render();
+    });
+    $("#include-default").addEventListener("change", (e) => {
+      this.options.includeDefault = e.target.checked;
+      this.render();
+    });
+    $("#apply").disabled = !cells;
+    $("#apply").textContent = cells
+      ? `Applica (${cells} ${cells === 1 ? "valore" : "valori"} in ${plan.results.length} ${plan.results.length === 1 ? "coppia" : "coppie"})`
+      : "Applica";
+  }
+
+  // --- controllo ------------------------------------------------------------------
+
+  renderCheck(content) {
+    const $ = this.element.$;
+    const analysis = analyzeKerning(this.grid, this.fc.glyphMap);
+    this.analysis = analysis;
+    const glyphMap = this.fc.glyphMap;
+    const sameCount = analysis.exceptions.filter((e) => e.same).length;
+    let html = `<p>Niente viene cambiato finché non scegli e premi <b>Applica</b>. Tutto si annulla con ⌘Z.</p>`;
+
+    // 1. Eccezioni
+    html += `<h3>Eccezioni che scavalcano un gruppo (${analysis.exceptions.length})</h3>`;
+    if (analysis.exceptions.length) {
+      html +=
+        `<p>Una coppia scritta per un glifo singolo vince sul valore del suo gruppo: quando cambi il gruppo, questa coppia non cambia. ` +
+        `<span class="tag same">uguale al gruppo</span> vuol dire che cancellandola non cambia niente di quello che vedi (${sameCount} su ${analysis.exceptions.length}). ` +
+        `Cancellata, la coppia torna a seguire il gruppo. In rosso i master dove l'eccezione è diversa dal gruppo.</p>` +
+        `<div class="toolbar"><button id="sel-same">Seleziona le uguali al gruppo</button><button id="sel-none">Nessuna</button></div>` +
+        `<table><thead>${this.masterHeader(3)}</thead><tbody>`;
+      for (const e of analysis.exceptions) {
+        html +=
+          `<tr class="first"><td><input type="checkbox" data-exc="${escapeHTML(e.key)}" ${this.selected.has(e.key) ? "checked" : ""}></td>` +
+          `<td class="l pair">${escapeHTML(pairLabel(glyphMap, e.left, e.right))}</td>` +
+          `<td class="l">${e.same ? `<span class="tag same">uguale al gruppo</span>` : `<span class="tag diff">diversa</span>`}</td>` +
+          this.valueCells(e.own, { classFor: (m) => (e.differs[this.grid.kernIds.indexOf(m.id)] ? "diff" : "") }) +
+          `</tr><tr class="sub"><td></td><td class="l">gruppo ${escapeHTML(e.fallbackLabel)}</td><td></td>` +
+          this.valueCells(e.fallback) +
+          `</tr>`;
+      }
+      html += `</tbody></table>`;
+    } else html += `<p class="none">Nessuna.</p>`;
+
+    // 2. Valori senza gruppo
+    html += `<h3>Valori legati a gruppi che non esistono più (${analysis.orphans.length})</h3>`;
+    if (analysis.orphans.length) {
+      html +=
+        `<p>Quando un gruppo si svuota (per esempio spostando i suoi glifi in un altro gruppo), Fontra non sposta il kerning: questi valori restano nel file ma non valgono per nessuna coppia.</p>` +
+        `<table><thead>${this.masterHeader(3)}</thead><tbody>`;
+      for (const o of analysis.orphans) {
+        const choice = this.choices.get(o.key) || "keep";
+        const options = [`<option value="keep">Lascia così</option>`, `<option value="delete">Cancella</option>`];
+        o.options.forEach((opt, i) => {
+          const text =
+            opt.kind === "move"
+              ? `Sposta su ${opt.left} ${opt.right} (vale per ${opt.count} ${opt.count === 1 ? "coppia" : "coppie"})`
+              : `Eccezione ${opt.left} ${opt.right}`;
+          options.push(`<option value="opt${i}">${escapeHTML(text)}</option>`);
+        });
+        html +=
+          `<tr class="first"><td class="l"><select data-orphan="${escapeHTML(o.key)}">${options.join("")}</select></td>` +
+          `<td class="l pair">${escapeHTML(`${o.left}  ${o.right}`)}</td>` +
+          `<td class="l muted">non esiste: ${escapeHTML(o.missing.join(", "))}</td>` +
+          this.valueCells(o.own) +
+          `</tr>`;
+        this._pendingSelect = this._pendingSelect || [];
+        this._pendingSelect.push([o.key, choice]);
+      }
+      html += `</tbody></table>`;
+    } else html += `<p class="none">Nessuno.</p>`;
+
+    // 3. Master vuoti
+    html += `<h3>Coppie con master vuoti (${analysis.incomplete.length})</h3>`;
+    if (analysis.incomplete.length) {
+      html +=
+        `<p>In un master vuoto la coppia vale 0, quindi il kerning salta da un master all'altro. Non sempre è un errore: a volte serve davvero solo in un master. Scegli tu, coppia per coppia.</p>` +
+        `<table><thead>${this.masterHeader(2)}</thead><tbody>`;
+      for (const p of analysis.incomplete) {
+        const options = [`<option value="keep">Lascia così</option>`];
+        if (p.canCorners) options.push(`<option value="corners">Riempi i vuoti dagli angoli</option>`);
+        if (p.common !== null && p.common !== 0) options.push(`<option value="copy">Metti ${p.common} nei vuoti</option>`);
+        const choice = this.choices.get(p.key) || "keep";
+        html +=
+          `<tr class="first"><td class="l"><select data-incomplete="${escapeHTML(p.key)}">${options.join("")}</select></td>` +
+          `<td class="l pair">${escapeHTML(pairLabel(glyphMap, p.left, p.right))}</td>` +
+          this.valueCells(p.own) +
+          `</tr>`;
+        if (p.canCorners) {
+          html +=
+            `<tr class="sub"><td></td><td class="l">dagli angoli</td>` +
+            this.grid.masters
+              .map((m) => {
+                const i = this.grid.kernIds.indexOf(m.id);
+                const v = i < 0 ? null : p.fromCorners[i];
+                return v === null ? `<td></td>` : `<td class="new">${v}</td>`;
+              })
+              .join("") +
+            `</tr>`;
+        }
+        this._pendingSelect = this._pendingSelect || [];
+        this._pendingSelect.push([p.key, choice]);
+      }
+      html += `</tbody></table>`;
+    } else html += `<p class="none">Nessuna.</p>`;
+
+    content.innerHTML = html;
+    for (const [key, choice] of this._pendingSelect || []) {
+      const select = [...content.querySelectorAll("select")].find(
+        (s) => s.dataset.orphan === key || s.dataset.incomplete === key
+      );
+      if (select && [...select.options].some((o) => o.value === choice)) select.value = choice;
+    }
+    this._pendingSelect = [];
+
+    for (const box of content.querySelectorAll("input[data-exc]")) {
+      box.addEventListener("change", () => {
+        if (box.checked) this.selected.add(box.dataset.exc);
+        else this.selected.delete(box.dataset.exc);
+        this.updateCheckButton();
+      });
+    }
+    for (const select of content.querySelectorAll("select")) {
+      select.addEventListener("change", () => {
+        this.choices.set(select.dataset.orphan ?? select.dataset.incomplete, select.value);
+        this.updateCheckButton();
+      });
+    }
+    $("#sel-same")?.addEventListener("click", () => {
+      for (const e of analysis.exceptions) if (e.same) this.selected.add(e.key);
+      this.render();
+    });
+    $("#sel-none")?.addEventListener("click", () => {
+      this.selected.clear();
+      this.render();
+    });
+    this.updateCheckButton();
+  }
+
+  checkActions() {
+    const actions = [];
+    for (const e of this.analysis.exceptions) if (this.selected.has(e.key)) actions.push({ type: "delete", item: e });
+    for (const o of this.analysis.orphans) {
+      const choice = this.choices.get(o.key) || "keep";
+      if (choice === "delete") actions.push({ type: "delete", item: o });
+      else if (choice.startsWith("opt")) actions.push({ type: "move", item: o, target: o.options[Number(choice.slice(3))] });
+    }
+    for (const p of this.analysis.incomplete) {
+      const choice = this.choices.get(p.key) || "keep";
+      if (choice === "corners" || choice === "copy") actions.push({ type: choice, item: p });
+    }
+    return actions;
+  }
+
+  updateCheckButton() {
+    const n = this.checkActions().length;
+    const button = this.element.$("#apply");
+    button.disabled = !n;
+    button.textContent = n ? `Applica (${n} ${n === 1 ? "modifica" : "modifiche"})` : "Applica";
+  }
+
+  // --- applica --------------------------------------------------------------------
+
+  async apply() {
+    const table = this.grid.table;
+    if (!table) return;
+    const builder = new ChangeBuilder();
+    let label;
+    let summary;
+    if (this.mode === "interpolate") {
+      let cells = 0;
+      for (const result of this.plan?.results || []) {
+        setPairValues(builder, table, result.left, result.right, result.next);
+        cells += result.cells.length;
+      }
+      label = "Calcola i master intermedi";
+      summary = `Fatto: ${cells} ${cells === 1 ? "valore calcolato" : "valori calcolati"}.`;
+    } else {
+      const actions = this.checkActions();
+      for (const action of actions) {
+        const { item } = action;
+        if (action.type === "delete") {
+          deletePairValues(builder, table, item.left, item.right);
+        } else if (action.type === "move") {
+          setPairValues(builder, table, action.target.left, action.target.right, clone(table.values[item.left][item.right]));
+          deletePairValues(builder, table, item.left, item.right);
+        } else {
+          const next = item.own.map((v, i) => {
+            if (v !== null) return v;
+            if (action.type === "copy") return item.common;
+            return item.fromCorners[i];
+          });
+          setPairValues(builder, table, item.left, item.right, next);
+        }
+      }
+      label = "Controlla kerning";
+      summary = `Fatto: ${actions.length} ${actions.length === 1 ? "modifica" : "modifiche"}. ⌘Z per annullare.`;
+    }
+    if (builder.isEmpty) return;
+    const button = this.element.$("#apply");
+    button.disabled = true;
+    try {
+      await this.host.apply(builder, label);
+      this.selected.clear();
+      this.choices.clear();
+      await this.reload();
+      if (this.element) this.element.$("#msg").textContent = summary;
+    } catch (error) {
+      console.error("[Testi di kerning]", error);
+      if (this.element) this.element.$("#msg").textContent = `Non è stato possibile applicare: ${error?.message || error}`;
+      button.disabled = false;
+    }
   }
 }
 
@@ -2048,6 +2983,12 @@ const METRICS_CSS = `
   .all input { width: auto; margin: 0; }
   .note:empty { display: none; }
   .note.error-note { opacity: 1; color: #e03131; }
+  .tools { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+  .tools button {
+    font: inherit; font-size: 0.9em; color: inherit; cursor: pointer; border-radius: 5px;
+    border: 1px solid #8884; background: transparent; padding: 2px 7px;
+  }
+  .tools button:hover { background: #8882; }
   input.linked { color: #3b82f6; }
   .link { text-align: center; font-size: 0.8em; color: #3b82f6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .link-row[hidden] { display: none; }
@@ -2079,7 +3020,11 @@ class MetricsElement extends HTMLElement {
       <label class="all" title="Margini e larghezza cambiano in tutti i master del glifo, non solo in quello scelto in Source">
         <input type="checkbox" id="all-masters" /> Tutti i master
       </label>
-      <div class="note" id="note"></div>`;
+      <div class="note" id="note"></div>
+      <div class="tools">
+        <button id="check-kerning" title="Eccezioni, valori senza gruppo, master vuoti: prima vedi, poi scegli">Controlla kerning…</button>
+        <button id="interpolate-kerning" title="Calcola dagli angoli i master intermedi del kerning: prima vedi cosa cambia">Master intermedi…</button>
+      </div>`;
     this.$ = (sel) => this.shadowRoot.querySelector(sel);
   }
 }
@@ -2102,6 +3047,10 @@ class OverviewMetrics {
       this.scheduleRefresh();
     });
     checkbox.addEventListener("keydown", (event) => event.stopPropagation());
+    const openDialog = (mode) =>
+      new KerningToolsDialog({ fc: this.fc, apply: (builder, label) => this.post(builder, label) }, mode).open();
+    this.element.$("#check-kerning").addEventListener("click", () => openDialog("check"));
+    this.element.$("#interpolate-kerning").addEventListener("click", () => openDialog("interpolate"));
     this.setupInputs();
     this.insertInSidebar();
     this.installChunkedUndo();
